@@ -107,7 +107,20 @@ async function getPendingState(phone) {
   if (phoneIdx === -1) return null;
   const row = rows.find((r) => r[phoneIdx] === phone);
   if (!row) return null;
-  return rowToObject(header, row);
+
+  // rowToObject uses the Sheet's own header text as keys (e.g. "Phone",
+  // "Step", "Name", "Age", "UpdatedAt" — capitalized). server.js expects
+  // lowercase keys (state.step, state.name, state.age), so we normalize
+  // here. Without this, state.step is always undefined and every message
+  // gets treated as a brand new conversation.
+  const obj = rowToObject(header, row);
+  return {
+    phone: obj.Phone,
+    step: obj.Step,
+    name: obj.Name,
+    age: obj.Age,
+    updatedAt: obj.UpdatedAt,
+  };
 }
 
 // Upserts a row for this phone number. Simple linear scan + update-by-range;
