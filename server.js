@@ -1,4 +1,4 @@
-// sheets.js
+// sheets.js.
 // All persistence lives in one Google Sheet, across three tabs:
 //
 //   Capacity  -> columns: Date | Capacity        (Date can be YYYY-MM-DD or the literal "Default")
