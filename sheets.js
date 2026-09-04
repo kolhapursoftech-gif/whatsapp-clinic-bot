@@ -94,7 +94,7 @@ async function appendBooking({ name, age, date, token, phone }) {
     valueInputOption: 'USER_ENTERED',
     insertDataOption: 'INSERT_ROWS',
     requestBody: {
-      values: [[new Date().toISOString(), name, age, date, token, phone]],
+      values: [[new Date().toISOString(), name, age, date, token, `'${phone}`]],
     },
   });
 }
@@ -118,7 +118,7 @@ async function setPendingState(phone, data) {
   const phoneIdx = header.indexOf('Phone');
 
   const newRow = [
-    phone,
+    `'${phone}`,
     data.step || '',
     data.name || '',
     data.age || '',
