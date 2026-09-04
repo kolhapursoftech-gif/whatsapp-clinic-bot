@@ -70,13 +70,20 @@ app.post('/webhook', async (req, res) => {
   // Always ack immediately; WhatsApp retries aggressively on non-200s.
   res.sendStatus(200);
 
+  console.log('POST /webhook received:', JSON.stringify(req.body));
+
   const event = whatsapp.parseIncomingMessage(req.body);
-  if (!event || !event.from) return;
+  if (!event || !event.from) {
+    console.log('Not a patient message (status update or unparseable) — ignoring.');
+    return;
+  }
 
   const { from, text, buttonId } = event;
+  console.log(`Parsed event: from=${from} text=${text} buttonId=${buttonId}`);
 
   try {
     let state = await sheets.getPendingState(from);
+    console.log('Current pending state:', JSON.stringify(state));
     if (!state || state.step === 'DONE' || !state.step) {
       // Fresh conversation (patient messaged in without going through the
       // missed-call trigger, or their previous booking is already complete).
@@ -155,7 +162,7 @@ app.post('/webhook', async (req, res) => {
       return;
     }
   } catch (err) {
-    console.error('webhook handling error:', err.message);
+    console.error('webhook handling error:', err.message, err.stack);
   }
 });
 
