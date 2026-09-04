@@ -1,187 +1,171 @@
-// server.js
-require('dotenv').config();
+// sheets.js
+// All persistence lives in one Google Sheet, across three tabs:
+//
+//   Capacity  -> columns: Date | Capacity        (Date can be YYYY-MM-DD or the literal "Default")
+//   Bookings  -> columns: Timestamp | Name | Age | Date | Token | Phone
+//   Pending   -> columns: Phone | Step | Name | Age | UpdatedAt
+//
+// We deliberately store conversation-in-progress state ("Pending") in the
+// Sheet rather than in server memory. Render's free tier spins the service
+// down when idle and loses anything held only in RAM — a patient who replies
+// a few minutes after the previous message would otherwise get treated as a
+// brand new conversation. Writing to the Sheet costs nothing extra since
+// we're already authenticated against it, and it survives restarts.
 
-const express = require('express');
-const whatsapp = require('./whatsapp');
-const sheets = require('./sheets');
-const groq = require('./groq');
+const { google } = require('googleapis');
 
-const app = express();
-app.use(express.json());
+const SHEET_ID = process.env.GOOGLE_SHEET_ID;
 
-const CLINIC_NAME = process.env.CLINIC_NAME || 'the clinic';
-const DOCTOR_NUMBER = process.env.DOCTOR_WHATSAPP_NUMBER;
-const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
-const TRIGGER_SECRET = process.env.TRIGGER_SECRET;
+let sheetsClientPromise = null;
 
-// ---------- date helpers (Asia/Kolkata) ----------
-
-function istDateString(offsetDays = 0) {
-  const now = new Date();
-  // Shift to IST (UTC+5:30) regardless of server timezone, then add offset days.
-  const istMs = now.getTime() + (5.5 * 60 + now.getTimezoneOffset()) * 60000;
-  const ist = new Date(istMs);
-  ist.setDate(ist.getDate() + offsetDays);
-  const y = ist.getFullYear();
-  const m = String(ist.getMonth() + 1).padStart(2, '0');
-  const d = String(ist.getDate()).padStart(2, '0');
-  return `${y}-${m}-${d}`;
+function getSheetsClient() {
+  if (!sheetsClientPromise) {
+    const auth = new google.auth.JWT({
+      email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
+      key: (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n'),
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+    sheetsClientPromise = auth.authorize().then(() => google.sheets({ version: 'v4', auth }));
+  }
+  return sheetsClientPromise;
 }
 
-// ---------- 1. Webhook verification (Meta calls this once when you set the webhook URL) ----------
+async function readTab(tabName) {
+  const sheets = await getSheetsClient();
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: `${tabName}!A:Z`,
+  });
+  const rows = res.data.values || [];
+  if (rows.length === 0) return { header: [], rows: [] };
+  const [header, ...body] = rows;
+  return { header, rows: body };
+}
 
-app.get('/webhook', (req, res) => {
-  const mode = req.query['hub.mode'];
-  const token = req.query['hub.verify_token'];
-  const challenge = req.query['hub.challenge'];
+function rowToObject(header, row) {
+  const obj = {};
+  header.forEach((key, i) => {
+    obj[key] = row[i] !== undefined ? row[i] : '';
+  });
+  return obj;
+}
 
-  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-    return res.status(200).send(challenge);
-  }
-  return res.sendStatus(403);
-});
+// ---------- Capacity ----------
 
-// ---------- 2. Missed-call trigger ----------
-// Generic endpoint: point ANY missed-call/forwarding service at this URL.
-// It just needs to POST { "phone": "91XXXXXXXXXX" } with the shared secret.
-app.post('/trigger-missed-call', async (req, res) => {
-  try {
-    if (req.query.secret !== TRIGGER_SECRET && req.headers['x-trigger-secret'] !== TRIGGER_SECRET) {
-      return res.sendStatus(401);
-    }
-    const phone = (req.body.phone || '').replace(/\D/g, '');
-    if (!phone) return res.status(400).send('phone is required');
+async function getCapacity(dateStr) {
+  const { header, rows } = await readTab('Capacity');
+  const dateIdx = header.indexOf('Date');
+  const capIdx = header.indexOf('Capacity');
+  if (dateIdx === -1 || capIdx === -1) return 0;
 
-    await sheets.setPendingState(phone, { step: 'ASK_NAME', name: '', age: '' });
-    await whatsapp.sendText(
-      phone,
-      `Namaskar! ${CLINIC_NAME} madhe swagat aahe. Appointment book karayla, kripaya tumche purna naav sanga.`
-    );
-    return res.sendStatus(200);
-  } catch (err) {
-    console.error('trigger-missed-call error:', err.message);
-    return res.sendStatus(500);
-  }
-});
+  const exact = rows.find((r) => r[dateIdx] === dateStr);
+  if (exact) return parseInt(exact[capIdx], 10) || 0;
 
-// ---------- 3. Incoming WhatsApp messages ----------
+  const fallback = rows.find((r) => r[dateIdx] === 'Default');
+  if (fallback) return parseInt(fallback[capIdx], 10) || 0;
 
-app.post('/webhook', async (req, res) => {
-  // Always ack immediately; WhatsApp retries aggressively on non-200s.
-  res.sendStatus(200);
+  return 0;
+}
 
-  console.log('POST /webhook received:', JSON.stringify(req.body));
+async function getBookedCount(dateStr) {
+  const { header, rows } = await readTab('Bookings');
+  const dateIdx = header.indexOf('Date');
+  if (dateIdx === -1) return 0;
+  return rows.filter((r) => r[dateIdx] === dateStr).length;
+}
 
-  const event = whatsapp.parseIncomingMessage(req.body);
-  if (!event || !event.from) {
-    console.log('Not a patient message (status update or unparseable) — ignoring.');
-    return;
-  }
+// Returns the next free token for a date, or null if the day is full.
+async function getNextAvailableToken(dateStr) {
+  const [capacity, booked] = await Promise.all([
+    getCapacity(dateStr),
+    getBookedCount(dateStr),
+  ]);
+  if (booked >= capacity) return null;
+  return booked + 1;
+}
 
-  const { from, text, buttonId } = event;
-  console.log(`Parsed event: from=${from} text=${text} buttonId=${buttonId}`);
+// ---------- Bookings ----------
 
-  try {
-    let state = await sheets.getPendingState(from);
-    console.log('Current pending state:', JSON.stringify(state));
-    if (!state || state.step === 'DONE' || !state.step) {
-      // Fresh conversation (patient messaged in without going through the
-      // missed-call trigger, or their previous booking is already complete).
-      state = { step: 'ASK_NAME', name: '', age: '' };
-      await sheets.setPendingState(from, state);
-      await whatsapp.sendText(
-        from,
-        `Namaskar! ${CLINIC_NAME} madhe swagat aahe. Appointment book karayla, kripaya tumche purna naav sanga.`
-      );
-      return;
-    }
+async function appendBooking({ name, age, date, token, phone }) {
+  const sheets = await getSheetsClient();
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: SHEET_ID,
+    range: 'Bookings!A:F',
+    valueInputOption: 'USER_ENTERED',
+    insertDataOption: 'INSERT_ROWS',
+    requestBody: {
+      // Prefix phone with an apostrophe so Sheets always stores it as text,
+      // never as a number (which silently mangles long digit strings into
+      // scientific notation and breaks later string matching). USER_ENTERED
+      // parses input the same way the Sheets UI does, so the leading
+      // apostrophe forces text formatting and is itself stripped from the
+      // stored value.
+      values: [[new Date().toISOString(), name, age, date, token, `'${phone}`]],
+    },
+  });
+}
 
-    if (state.step === 'ASK_NAME') {
-      if (!text || text.trim().length < 2) {
-        const reply = await groq.getFallbackReply(text || '', 'ASK_NAME');
-        await whatsapp.sendText(from, reply);
-        return;
-      }
-      await sheets.setPendingState(from, { step: 'ASK_AGE', name: text.trim(), age: '' });
-      await whatsapp.sendText(from, `Dhanyawad, ${text.trim()}. Aata tumche vay (age) sanga.`);
-      return;
-    }
+// ---------- Pending conversation state ----------
 
-    if (state.step === 'ASK_AGE') {
-      const age = parseInt(text, 10);
-      if (!text || isNaN(age) || age <= 0 || age > 120) {
-        const reply = await groq.getFallbackReply(text || '', 'ASK_AGE');
-        await whatsapp.sendText(from, reply);
-        return;
-      }
-      await sheets.setPendingState(from, { step: 'ASK_DATE', name: state.name, age: String(age) });
-      await whatsapp.sendButtons(from, 'Appointment kevha havi aahe?', [
-        { id: 'today', title: 'Aaj' },
-        { id: 'tomorrow', title: 'Udya' },
-      ]);
-      return;
-    }
+async function getPendingState(phone) {
+  const { header, rows } = await readTab('Pending');
+  const phoneIdx = header.indexOf('Phone');
+  if (phoneIdx === -1) return null;
+  const row = rows.find((r) => r[phoneIdx] === phone);
+  if (!row) return null;
+  return rowToObject(header, row);
+}
 
-    if (state.step === 'ASK_DATE') {
-      let offsetDays = null;
-      if (buttonId === 'today' || /^aaj$/i.test(text || '')) offsetDays = 0;
-      else if (buttonId === 'tomorrow' || /^udya$/i.test(text || '')) offsetDays = 1;
+// Upserts a row for this phone number. Simple linear scan + update-by-range;
+// fine at clinic scale (a handful of concurrent conversations at most).
+async function setPendingState(phone, data) {
+  const sheets = await getSheetsClient();
+  const { header, rows } = await readTab('Pending');
+  const phoneIdx = header.indexOf('Phone');
 
-      if (offsetDays === null) {
-        // Didn't use the buttons / typed something else — re-show the buttons.
-        await whatsapp.sendButtons(from, 'Kripaya button dabun date select kara:', [
-          { id: 'today', title: 'Aaj' },
-          { id: 'tomorrow', title: 'Udya' },
-        ]);
-        return;
-      }
+  const newRow = [
+    `'${phone}`,
+    data.step || '',
+    data.name || '',
+    data.age || '',
+    new Date().toISOString(),
+  ];
 
-      const dateStr = istDateString(offsetDays);
-      let token = await sheets.getNextAvailableToken(dateStr);
+  const existingIndex = phoneIdx === -1 ? -1 : rows.findIndex((r) => r[phoneIdx] === phone);
 
-      if (token === null && offsetDays === 0) {
-        // Today full -> offer tomorrow automatically.
-        const tomorrowStr = istDateString(1);
-        const tomorrowToken = await sheets.getNextAvailableToken(tomorrowStr);
-        if (tomorrowToken === null) {
-          await whatsapp.sendText(from, 'Kshama kara, Aaj ani Udya donhi divas full aahet. Kripaya nantar sampark sadha.');
-          await sheets.clearPendingState(from);
-          return;
-        }
-        await finalizeBooking(from, state.name, state.age, tomorrowStr, tomorrowToken);
-        return;
-      }
-
-      if (token === null) {
-        await whatsapp.sendText(from, 'Kshama kara, ha divas full aahe. Kripaya nantar sampark sadha.');
-        await sheets.clearPendingState(from);
-        return;
-      }
-
-      await finalizeBooking(from, state.name, state.age, dateStr, token);
-      return;
-    }
-  } catch (err) {
-    console.error('webhook handling error:', err.message, err.stack);
-  }
-});
-
-async function finalizeBooking(phone, name, age, dateStr, token) {
-  await sheets.appendBooking({ name, age, date: dateStr, token, phone });
-  await sheets.clearPendingState(phone);
-
-  await whatsapp.sendText(
-    phone,
-    `Booking confirm zali!\nNaav: ${name}\nToken Number: ${token}\nDate: ${dateStr}\n\nKripaya tumcha token number sobat ghevun ya.`
-  );
-
-  if (DOCTOR_NUMBER) {
-    await whatsapp.sendText(
-      DOCTOR_NUMBER,
-      `Naveen Booking: ${name} (${age}) - Token #${token} - ${dateStr}`
-    );
+  if (existingIndex === -1) {
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SHEET_ID,
+      range: 'Pending!A:E',
+      valueInputOption: 'USER_ENTERED',
+      insertDataOption: 'INSERT_ROWS',
+      requestBody: { values: [newRow] },
+    });
+  } else {
+    // +2 = +1 for header row, +1 because Sheets ranges are 1-indexed
+    const sheetRowNumber = existingIndex + 2;
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SHEET_ID,
+      range: `Pending!A${sheetRowNumber}:E${sheetRowNumber}`,
+      valueInputOption: 'USER_ENTERED',
+      requestBody: { values: [newRow] },
+    });
   }
 }
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`WhatsApp clinic bot listening on port ${PORT}`));
+async function clearPendingState(phone) {
+  // Simplest reliable option with the Sheets API without deleting rows
+  // (which would shift every other row's index mid-use): mark it DONE.
+  // Any DONE / missing row is treated as "no active conversation".
+  await setPendingState(phone, { step: 'DONE', name: '', age: '' });
+}
+
+module.exports = {
+  getCapacity,
+  getBookedCount,
+  getNextAvailableToken,
+  appendBooking,
+  getPendingState,
+  setPendingState,
+  clearPendingState,
+};
