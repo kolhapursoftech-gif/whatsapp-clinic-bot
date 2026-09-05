@@ -88,6 +88,13 @@ async function getSettings() {
     upiId: map['UPI ID'] || '',
     staffNumber: (map['Staff WhatsApp Number'] || '').replace(/\D/g, ''),
     clinicName: map['Clinic Name'] || 'the clinic',
+    morningStart: map['Morning Start'] || '',
+    morningEnd: map['Morning End'] || '',
+    eveningStart: map['Evening Start'] || '',
+    eveningEnd: map['Evening End'] || '',
+    slotDurationMin: map['Slot Duration Minutes'] || '15',
+    maxCapacityPerSlot: map['Max Capacity Per Slot'] || '1',
+    daysAhead: map['Days To Generate Ahead'] || '7',
   };
   settingsCacheAt = now;
   return settingsCache;
@@ -156,6 +163,107 @@ async function getNextAvailableTokenForSlot(dateStr, slot) {
 
   const bookedInDay = bookingsTab.rows.filter((r) => r[bDateIdx] === dateStr).length;
   return bookedInDay + 1;
+}
+
+// ---------- Auto-generating Capacity rows from Settings ----------
+// Lets the clinic change opening hours / slot length / capacity in one
+// place (Settings tab) instead of typing every row by hand. Call
+// generateUpcomingSlots() (wired to a protected HTTP endpoint in server.js)
+// whenever you want to top up the next few days of slots.
+
+function istDateStringLocal(offsetDays = 0) {
+  const now = new Date();
+  const istMs = now.getTime() + (5.5 * 60 + now.getTimezoneOffset()) * 60000;
+  const ist = new Date(istMs);
+  ist.setDate(ist.getDate() + offsetDays);
+  const y = ist.getFullYear();
+  const m = String(ist.getMonth() + 1).padStart(2, '0');
+  const d = String(ist.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+// "10:00 AM" / "5:30 PM" -> minutes since midnight. Returns null if the
+// text doesn't match (e.g. left blank in Settings — that period is skipped).
+function parseTimeToMinutes(timeStr) {
+  const match = /^(\d{1,2}):(\d{2})\s*(AM|PM)$/i.exec((timeStr || '').trim());
+  if (!match) return null;
+  let hour = parseInt(match[1], 10);
+  const minute = parseInt(match[2], 10);
+  const isPm = /pm/i.test(match[3]);
+  if (isPm && hour !== 12) hour += 12;
+  if (!isPm && hour === 12) hour = 0;
+  return hour * 60 + minute;
+}
+
+function formatMinutesToTime(totalMinutes) {
+  let hour = Math.floor(totalMinutes / 60);
+  const minute = totalMinutes % 60;
+  const isPm = hour >= 12;
+  let hour12 = hour % 12;
+  if (hour12 === 0) hour12 = 12;
+  return `${hour12}:${String(minute).padStart(2, '0')} ${isPm ? 'PM' : 'AM'}`;
+}
+
+function buildSlotsForRange(startStr, endStr, durationMin) {
+  const start = parseTimeToMinutes(startStr);
+  const end = parseTimeToMinutes(endStr);
+  if (start === null || end === null || durationMin <= 0) return [];
+  const slots = [];
+  for (let t = start; t + durationMin <= end; t += durationMin) {
+    slots.push(formatMinutesToTime(t));
+  }
+  return slots;
+}
+
+// Generates Date+Slot rows for the next N days (from Settings) and appends
+// only the ones that don't already exist in the Capacity tab — safe to run
+// again and again (e.g. once a day) without creating duplicates. Changing
+// Morning/Evening times or duration in Settings only affects days generated
+// AFTER that change; already-generated rows are not retroactively edited.
+async function generateUpcomingSlots() {
+  const settings = await getSettings();
+  const daysAhead = parseInt(settings.daysAhead, 10) || 7;
+  const durationMin = parseInt(settings.slotDurationMin, 10) || 15;
+  const maxCap = parseInt(settings.maxCapacityPerSlot, 10) || 1;
+
+  const morningSlots = buildSlotsForRange(settings.morningStart, settings.morningEnd, durationMin);
+  const eveningSlots = buildSlotsForRange(settings.eveningStart, settings.eveningEnd, durationMin);
+  const dailySlots = [...morningSlots, ...eveningSlots];
+
+  if (dailySlots.length === 0) {
+    throw new Error(
+      'No valid Morning Start/End or Evening Start/End found in Settings (expected format like "10:00 AM").'
+    );
+  }
+
+  const { header, rows } = await readTab('Capacity');
+  const dateIdx = header.indexOf('Date');
+  const slotIdx = header.indexOf('Slot');
+  const existingKeys = new Set(rows.map((r) => `${r[dateIdx]}__${r[slotIdx]}`));
+
+  const newRows = [];
+  for (let d = 0; d < daysAhead; d++) {
+    const dateStr = istDateStringLocal(d);
+    for (const slot of dailySlots) {
+      const key = `${dateStr}__${slot}`;
+      if (!existingKeys.has(key)) {
+        newRows.push([dateStr, slot, maxCap, 0]);
+      }
+    }
+  }
+
+  if (newRows.length > 0) {
+    const sheets = await getSheetsClient();
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SHEET_ID,
+      range: 'Capacity!A:D',
+      valueInputOption: 'USER_ENTERED',
+      insertDataOption: 'INSERT_ROWS',
+      requestBody: { values: newRows },
+    });
+  }
+
+  return { daysAhead, slotsPerDay: dailySlots.length, added: newRows.length };
 }
 
 // ---------- Bookings ----------
@@ -276,6 +384,7 @@ module.exports = {
   getSettings,
   getAvailableSlots,
   getNextAvailableTokenForSlot,
+  generateUpcomingSlots,
   appendBooking,
   getPendingState,
   setPendingState,
