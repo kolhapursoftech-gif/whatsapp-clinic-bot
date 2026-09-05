@@ -213,9 +213,17 @@ app.post('/webhook', async (req, res) => {
     const clinicName = settings.clinicName || CLINIC_NAME_FALLBACK;
 
     // ---- Staff replying "CONFIRM 9876" to approve a payment screenshot ----
-    if (staffNumber && from === staffNumber && text && CONFIRM_REGEX.test(text)) {
-      const lastDigits = text.match(CONFIRM_REGEX)[1];
-      await handleStaffConfirm(lastDigits, staffNumber, clinicName);
+    if (staffNumber && from === staffNumber) {
+      if (text && CONFIRM_REGEX.test(text)) {
+        const lastDigits = text.match(CONFIRM_REGEX)[1];
+        await handleStaffConfirm(lastDigits, staffNumber, clinicName);
+      } else {
+        // Any other message from the staff number (typos, "ok", forwarded
+        // media, etc.) is ignored here instead of falling through to the
+        // patient booking flow below — otherwise the bot would mistakenly
+        // start asking the staff member for their name/age.
+        console.log(`Ignoring non-CONFIRM message from staff number: "${text}"`);
+      }
       return;
     }
 
