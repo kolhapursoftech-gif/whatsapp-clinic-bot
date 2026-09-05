@@ -95,6 +95,7 @@ async function getSettings() {
     slotDurationMin: map['Slot Duration Minutes'] || '15',
     maxCapacityPerSlot: map['Max Capacity Per Slot'] || '1',
     daysAhead: map['Days To Generate Ahead'] || '7',
+    minNoticeMinutes: map['Minimum Notice Minutes'] || '30',
   };
   settingsCacheAt = now;
   return settingsCache;
@@ -104,6 +105,9 @@ async function getSettings() {
 
 // Returns every slot on a given date that still has room, e.g.
 // [{ slot: '10:00 AM', remaining: 2 }, { slot: '10:15 AM', remaining: 1 }]
+// If dateStr is today, slots earlier than (now + Minimum Notice Minutes)
+// are excluded — otherwise the bot would happily offer a 10:00 AM slot at
+// 9:48 PM the same day.
 async function getAvailableSlots(dateStr) {
   const capacityTab = await readTab('Capacity');
   const dateIdx = capacityTab.header.indexOf('Date');
@@ -118,9 +122,23 @@ async function getAvailableSlots(dateStr) {
   const bDateIdx = bookingsTab.header.indexOf('Date');
   const bSlotIdx = bookingsTab.header.indexOf('Slot');
 
+  const settings = await getSettings();
+  const minNotice = parseInt(settings.minNoticeMinutes, 10) || 0;
+  const todayStr = istDateStringLocal(0);
+  const isToday = dateStr.trim() === todayStr;
+  const cutoffMinutes = isToday ? getIstNowMinutes() + minNotice : null;
+
   const results = [];
   for (const row of slotRows) {
     const slot = (row[slotIdx] || '').trim();
+
+    if (isToday) {
+      const slotMinutes = parseTimeToMinutes(slot);
+      // If the slot time can't be parsed, don't silently hide it — only
+      // exclude slots we can confidently confirm are in the past.
+      if (slotMinutes !== null && slotMinutes < cutoffMinutes) continue;
+    }
+
     const maxCap = parseInt(row[capIdx], 10) || 0;
     const booked =
       bDateIdx === -1 || bSlotIdx === -1
@@ -188,6 +206,15 @@ function istDateStringLocal(offsetDays = 0) {
   const m = String(ist.getMonth() + 1).padStart(2, '0');
   const d = String(ist.getDate()).padStart(2, '0');
   return `${y}-${m}-${d}`;
+}
+
+// Current time-of-day in IST, as minutes since midnight — used to hide
+// slots that have already passed (or are too soon) for today's date.
+function getIstNowMinutes() {
+  const now = new Date();
+  const istMs = now.getTime() + (5.5 * 60 + now.getTimezoneOffset()) * 60000;
+  const ist = new Date(istMs);
+  return ist.getHours() * 60 + ist.getMinutes();
 }
 
 // "10:00 AM" / "5:30 PM" -> minutes since midnight. Returns null if the
