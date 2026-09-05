@@ -58,6 +58,39 @@ async function sendButtons(to, bodyText, buttons) {
   );
 }
 
+// Sends a WhatsApp interactive "list" message — used when there are more
+// than 3 options (time slots), since quick-reply buttons cap out at 3.
+// rows: [{ id: '10:00 AM', title: '10:00 AM', description: '2 left' }, ...]
+// Max 10 rows per Meta's limits; title <=24 chars, buttonLabel <=20 chars.
+async function sendList(to, bodyText, buttonLabel, rows) {
+  await client().post(
+    '/messages',
+    {
+      messaging_product: 'whatsapp',
+      to,
+      type: 'interactive',
+      interactive: {
+        type: 'list',
+        body: { text: bodyText },
+        action: {
+          button: buttonLabel,
+          sections: [
+            {
+              title: 'Available Slots',
+              rows: rows.map((r) => ({
+                id: r.id,
+                title: r.title,
+                description: r.description || undefined,
+              })),
+            },
+          ],
+        },
+      },
+    },
+    { headers: { 'Content-Type': 'application/json' } }
+  );
+}
+
 // Uploads a binary buffer (e.g. a QR code PNG we generated in memory) to
 // Meta so it can be referenced by media id in a later /messages call.
 // Images cannot be sent as raw bytes in the messages payload directly —
@@ -132,6 +165,11 @@ function parseIncomingMessage(webhookBody) {
     } else if (message.type === 'interactive' && message.interactive.type === 'button_reply') {
       buttonId = message.interactive.button_reply.id;
       text = message.interactive.button_reply.title;
+    } else if (message.type === 'interactive' && message.interactive.type === 'list_reply') {
+      // Same shape as button_reply — reused for time-slot selection so the
+      // rest of the code doesn't need a separate "listReplyId" field.
+      buttonId = message.interactive.list_reply.id;
+      text = message.interactive.list_reply.title;
     } else if (message.type === 'image') {
       imageId = message.image.id;
     }
@@ -145,6 +183,7 @@ function parseIncomingMessage(webhookBody) {
 module.exports = {
   sendText,
   sendButtons,
+  sendList,
   sendUpiQr,
   forwardImage,
   parseIncomingMessage,
