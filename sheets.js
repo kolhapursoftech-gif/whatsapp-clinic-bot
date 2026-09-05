@@ -1,10 +1,18 @@
 // sheets.js
 // All persistence lives in one Google Sheet, across four tabs:
 //
-//   Settings  -> columns: Key | Value             (Appointment Fee, UPI ID, Staff WhatsApp Number, Clinic Name)
-//   Capacity  -> columns: Date | Capacity          (Date can be YYYY-MM-DD or the literal "Default")
-//   Bookings  -> columns: Timestamp | Name | Age | Date | Token | Phone | Payment Status
-//   Pending   -> columns: Phone | Step | Name | Age | Date | UpdatedAt
+//   Settings  -> columns: Key | Value
+//                (rows used: Appointment Fee, UPI ID, Staff WhatsApp Number, Clinic Name)
+//   Capacity  -> columns: Date | Slot | Max Capacity | Booked Count
+//                (Date can be YYYY-MM-DD or the literal "Default". "Slot" and
+//                "Booked Count" are informational only — the bot computes the
+//                actual booked count live from the Bookings tab instead of
+//                trusting a manually-editable counter.)
+//   Bookings  -> columns: Timestamp | Phone Number | Name | Age | Date | Token Number | Payment Status
+//   Pending   -> columns: Phone Number | Step | Name | Age | Date | Timestamp
+//
+// NOTE: header names here must match the Sheet EXACTLY (including spaces) —
+// the code looks columns up by header text via indexOf(), not by position.
 //
 // We deliberately store conversation-in-progress state ("Pending") in the
 // Sheet rather than in server memory. Render's free tier spins the service
@@ -90,7 +98,7 @@ async function getSettings() {
 async function getCapacity(dateStr) {
   const { header, rows } = await readTab('Capacity');
   const dateIdx = header.indexOf('Date');
-  const capIdx = header.indexOf('Capacity');
+  const capIdx = header.indexOf('Max Capacity');
   if (dateIdx === -1 || capIdx === -1) return 0;
 
   const exact = rows.find((r) => r[dateIdx] === dateStr);
@@ -129,13 +137,15 @@ async function getNextAvailableToken(dateStr) {
 
 async function appendBooking({ name, age, date, token, phone, paymentStatus }) {
   const sheets = await getSheetsClient();
+  // Column order here MUST match the actual Bookings tab:
+  // Timestamp | Phone Number | Name | Age | Date | Token Number | Payment Status
   await sheets.spreadsheets.values.append({
     spreadsheetId: SHEET_ID,
     range: 'Bookings!A:G',
     valueInputOption: 'USER_ENTERED',
     insertDataOption: 'INSERT_ROWS',
     requestBody: {
-      values: [[new Date().toISOString(), name, age, date, token, `'${phone}`, paymentStatus || 'Paid']],
+      values: [[new Date().toISOString(), `'${phone}`, name, age, date, token, paymentStatus || 'Paid']],
     },
   });
 }
@@ -144,19 +154,19 @@ async function appendBooking({ name, age, date, token, phone, paymentStatus }) {
 
 async function getPendingState(phone) {
   const { header, rows } = await readTab('Pending');
-  const phoneIdx = header.indexOf('Phone');
+  const phoneIdx = header.indexOf('Phone Number');
   if (phoneIdx === -1) return null;
   const row = rows.find((r) => stripQuote(r[phoneIdx]) === phone);
   if (!row) return null;
 
   const obj = rowToObject(header, row);
   return {
-    phone: stripQuote(obj.Phone),
+    phone: stripQuote(obj['Phone Number']),
     step: obj.Step,
     name: obj.Name,
     age: obj.Age,
     date: obj.Date,
-    updatedAt: obj.UpdatedAt,
+    updatedAt: obj.Timestamp,
   };
 }
 
@@ -165,7 +175,7 @@ async function getPendingState(phone) {
 async function setPendingState(phone, data) {
   const sheets = await getSheetsClient();
   const { header, rows } = await readTab('Pending');
-  const phoneIdx = header.indexOf('Phone');
+  const phoneIdx = header.indexOf('Phone Number');
 
   const newRow = [
     `'${phone}`,
@@ -210,7 +220,7 @@ async function clearPendingState(phone) {
 // specific step. Returns null if nothing matches.
 async function findPendingByLastDigits(lastDigits, expectedStep) {
   const { header, rows } = await readTab('Pending');
-  const phoneIdx = header.indexOf('Phone');
+  const phoneIdx = header.indexOf('Phone Number');
   const stepIdx = header.indexOf('Step');
   if (phoneIdx === -1) return null;
 
@@ -223,7 +233,7 @@ async function findPendingByLastDigits(lastDigits, expectedStep) {
 
   const obj = rowToObject(header, match);
   return {
-    phone: stripQuote(obj.Phone),
+    phone: stripQuote(obj['Phone Number']),
     step: obj.Step,
     name: obj.Name,
     age: obj.Age,
