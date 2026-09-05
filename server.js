@@ -168,6 +168,28 @@ app.post('/trigger-missed-call', async (req, res) => {
   }
 });
 
+// ---------- 2b. Admin: auto-generate upcoming Capacity slots ----------
+// Visit this URL in a browser (with your TRIGGER_SECRET) whenever you want
+// to top up the next few days of time slots, based on the Morning/Evening
+// hours, slot duration, and capacity set in the Settings tab. Safe to call
+// repeatedly — it skips date+slot combos that already exist.
+//
+// Example: https://your-app.onrender.com/admin/generate-slots?secret=YOUR_SECRET
+app.get('/admin/generate-slots', async (req, res) => {
+  if (req.query.secret !== TRIGGER_SECRET) {
+    return res.sendStatus(401);
+  }
+  try {
+    const summary = await sheets.generateUpcomingSlots();
+    res.send(
+      `Slots generated.\nDays ahead: ${summary.daysAhead}\nSlots per day: ${summary.slotsPerDay}\nNew rows added: ${summary.added}`
+    );
+  } catch (err) {
+    console.error('generate-slots error:', err.message);
+    res.status(500).send('Error: ' + err.message);
+  }
+});
+
 // ---------- 3. Incoming WhatsApp messages ----------
 
 app.post('/webhook', async (req, res) => {
