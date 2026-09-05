@@ -4,17 +4,18 @@ require('dotenv').config();
 const express = require('express');
 const whatsapp = require('./whatsapp');
 const sheets = require('./sheets');
-const groq = require('./groq');
+const { getMessages, LANGUAGE_BUTTONS, LANGUAGE_PROMPT } = require('./messages');
 
 const app = express();
 app.use(express.json());
 
-const CLINIC_NAME = process.env.CLINIC_NAME || 'the clinic';
+const CLINIC_NAME_FALLBACK = process.env.CLINIC_NAME || 'the clinic';
 const DOCTOR_NUMBER = process.env.DOCTOR_WHATSAPP_NUMBER; // fallback if Settings tab has none
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
 const TRIGGER_SECRET = process.env.TRIGGER_SECRET;
 
 const CONFIRM_REGEX = /^CONFIRM\s+(\d{3,4})$/i;
+const LANG_MAP = { lang_mr: 'mr', lang_hi: 'hi', lang_en: 'en' };
 
 // ---------- date helpers (Asia/Kolkata) ----------
 
@@ -43,6 +44,111 @@ app.get('/webhook', (req, res) => {
   return res.sendStatus(403);
 });
 
+// ---------- helpers shared by the missed-call trigger and the webhook handler ----------
+
+async function startConversation(phone) {
+  await sheets.setPendingState(phone, { step: 'ASK_LANGUAGE', name: '', age: '', date: '', slot: '', lang: '' });
+  await whatsapp.sendButtons(phone, LANGUAGE_PROMPT, LANGUAGE_BUTTONS);
+}
+
+// Sends the slot list for a date if any slots are free, storing that date on
+// the pending state. Returns true if a list was sent, false if the day is
+// fully booked (so the caller can fall back to the next day or apologize).
+async function sendSlotList(phone, state, dateStr) {
+  const M = getMessages(state.lang);
+  const slots = await sheets.getAvailableSlots(dateStr);
+  if (slots.length === 0) return false;
+
+  const rows = slots.slice(0, 10).map((s) => ({
+    id: s.slot,
+    title: s.slot,
+    description: `${s.remaining} ${M.slotsLeftLabel}`,
+  }));
+
+  await sheets.setPendingState(phone, {
+    step: 'ASK_SLOT',
+    name: state.name,
+    age: state.age,
+    date: dateStr,
+    lang: state.lang,
+  });
+
+  await whatsapp.sendList(phone, M.askSlotBody(dateStr), M.askSlotButtonLabel, rows);
+  return true;
+}
+
+async function movePatientToPaymentStep(phone, state, settingsObj) {
+  const M = getMessages(state.lang);
+  await sheets.setPendingState(phone, {
+    step: 'AWAITING_PAYMENT_SCREENSHOT',
+    name: state.name,
+    age: state.age,
+    date: state.date,
+    slot: state.slot,
+    lang: state.lang,
+  });
+  await whatsapp.sendUpiQr(phone, {
+    upiId: settingsObj.upiId,
+    amount: settingsObj.feeAmount,
+    clinicName: settingsObj.clinicName,
+    caption: M.paymentCaption(settingsObj.feeAmount, settingsObj.upiId, settingsObj.clinicName),
+  });
+}
+
+async function finalizeBooking(phone, name, age, dateStr, slot, token, opts = {}) {
+  await sheets.appendBooking({
+    name,
+    age,
+    date: dateStr,
+    slot,
+    token,
+    phone,
+    paymentStatus: opts.paymentStatus || 'Paid',
+  });
+  await sheets.clearPendingState(phone);
+
+  const M = getMessages(opts.lang);
+  await whatsapp.sendText(
+    phone,
+    M.bookingConfirmed(opts.clinicName || CLINIC_NAME_FALLBACK, name, token, dateStr, slot)
+  );
+
+  const notifyNumber = opts.staffNumber || DOCTOR_NUMBER;
+  if (notifyNumber) {
+    await whatsapp.sendText(
+      notifyNumber,
+      `Naveen Booking: ${name} (${age}) - Token #${token} - ${dateStr} ${slot} (Payment: ${opts.paymentStatus || 'Paid'})`
+    );
+  }
+}
+
+async function handleStaffConfirm(lastDigits, staffNum, clinicName) {
+  const pending = await sheets.findPendingByLastDigits(lastDigits, 'AWAITING_STAFF_CONFIRM');
+  if (!pending) {
+    await whatsapp.sendText(staffNum, `Konatehi pending payment "${lastDigits}" ne sampat nahi. Tapasun parat pathva.`);
+    return;
+  }
+
+  const token = await sheets.getNextAvailableTokenForSlot(pending.date, pending.slot);
+  if (token === null) {
+    await whatsapp.sendText(
+      staffNum,
+      `${pending.date} ${pending.slot} cha slot ata full zala aahe. Patient la sanga vegla slot nivda.`
+    );
+    const M = getMessages(pending.lang);
+    await whatsapp.sendText(pending.phone, M.slotNowFull);
+    return;
+  }
+
+  await finalizeBooking(pending.phone, pending.name, pending.age, pending.date, pending.slot, token, {
+    paymentStatus: 'Paid',
+    staffNumber: staffNum,
+    lang: pending.lang,
+    clinicName,
+  });
+  await whatsapp.sendText(staffNum, `Confirm zala. Token #${token} patient la pathavla.`);
+}
+
 // ---------- 2. Missed-call trigger ----------
 // Generic endpoint: point ANY missed-call/forwarding service at this URL.
 // It just needs to POST { "phone": "91XXXXXXXXXX" } with the shared secret.
@@ -54,80 +160,13 @@ app.post('/trigger-missed-call', async (req, res) => {
     const phone = (req.body.phone || '').replace(/\D/g, '');
     if (!phone) return res.status(400).send('phone is required');
 
-    await sheets.setPendingState(phone, { step: 'ASK_NAME', name: '', age: '', date: '' });
-    await whatsapp.sendText(
-      phone,
-      `Namaskar! ${CLINIC_NAME} madhe swagat aahe. Appointment book karayla, kripaya tumche purna naav sanga.`
-    );
+    await startConversation(phone);
     return res.sendStatus(200);
   } catch (err) {
     console.error('trigger-missed-call error:', err.message);
     return res.sendStatus(500);
   }
 });
-
-// ---------- helpers used by the webhook handler ----------
-
-async function movePatientToPaymentStep(phone, currentState, dateStr, settingsObj) {
-  await sheets.setPendingState(phone, {
-    step: 'AWAITING_PAYMENT_SCREENSHOT',
-    name: currentState.name,
-    age: currentState.age,
-    date: dateStr,
-  });
-  await whatsapp.sendUpiQr(phone, {
-    upiId: settingsObj.upiId,
-    amount: settingsObj.feeAmount,
-    clinicName: settingsObj.clinicName || CLINIC_NAME,
-    caption: `Appointment fee: Rs ${settingsObj.feeAmount}\nUPI ID: ${settingsObj.upiId}\n\nQR scan karun payment kara, ani payment cha screenshot ithech pathva.`,
-  });
-}
-
-async function finalizeBooking(phone, name, age, dateStr, token, opts = {}) {
-  await sheets.appendBooking({
-    name,
-    age,
-    date: dateStr,
-    token,
-    phone,
-    paymentStatus: opts.paymentStatus || 'Paid',
-  });
-  await sheets.clearPendingState(phone);
-
-  await whatsapp.sendText(
-    phone,
-    `Booking confirm zali!\nNaav: ${name}\nToken Number: ${token}\nDate: ${dateStr}\n\nKripaya tumcha token number sobat ghevun ya.`
-  );
-
-  const notifyNumber = opts.staffNumber || DOCTOR_NUMBER;
-  if (notifyNumber) {
-    await whatsapp.sendText(
-      notifyNumber,
-      `Naveen Booking: ${name} (${age}) - Token #${token} - ${dateStr} (Payment: ${opts.paymentStatus || 'Paid'})`
-    );
-  }
-}
-
-async function handleStaffConfirm(lastDigits, staffNum) {
-  const pending = await sheets.findPendingByLastDigits(lastDigits, 'AWAITING_STAFF_CONFIRM');
-  if (!pending) {
-    await whatsapp.sendText(staffNum, `Konatehi pending payment "${lastDigits}" ne sampat nahi. Tapasun parat pathva.`);
-    return;
-  }
-
-  const token = await sheets.getNextAvailableToken(pending.date);
-  if (token === null) {
-    await whatsapp.sendText(staffNum, `${pending.date} cha divas ata full zala aahe. Patient la sanga vegla divas nivda.`);
-    await whatsapp.sendText(pending.phone, 'Kshama kara, tumcha divas ata full zala aahe. Kripaya doctor shi sampark sadha.');
-    return;
-  }
-
-  await finalizeBooking(pending.phone, pending.name, pending.age, pending.date, token, {
-    paymentStatus: 'Paid',
-    staffNumber: staffNum,
-  });
-  await whatsapp.sendText(staffNum, `Confirm zala. Token #${token} patient la pathavla.`);
-}
 
 // ---------- 3. Incoming WhatsApp messages ----------
 
@@ -149,92 +188,120 @@ app.post('/webhook', async (req, res) => {
   try {
     const settings = await sheets.getSettings();
     const staffNumber = settings.staffNumber || (DOCTOR_NUMBER || '').replace(/\D/g, '');
-    const clinicName = settings.clinicName || CLINIC_NAME;
+    const clinicName = settings.clinicName || CLINIC_NAME_FALLBACK;
 
     // ---- Staff replying "CONFIRM 9876" to approve a payment screenshot ----
     if (staffNumber && from === staffNumber && text && CONFIRM_REGEX.test(text)) {
       const lastDigits = text.match(CONFIRM_REGEX)[1];
-      await handleStaffConfirm(lastDigits, staffNumber);
+      await handleStaffConfirm(lastDigits, staffNumber, clinicName);
       return;
     }
 
     let state = await sheets.getPendingState(from);
     console.log('Current pending state:', JSON.stringify(state));
+
     if (!state || state.step === 'DONE' || !state.step) {
       // Fresh conversation (patient messaged in without going through the
       // missed-call trigger, or their previous booking is already complete).
-      state = { step: 'ASK_NAME', name: '', age: '', date: '' };
-      await sheets.setPendingState(from, state);
-      await whatsapp.sendText(
-        from,
-        `Namaskar! ${clinicName} madhe swagat aahe. Appointment book karayla, kripaya tumche purna naav sanga.`
-      );
+      await startConversation(from);
       return;
     }
 
-    if (state.step === 'ASK_NAME') {
-      if (!text || text.trim().length < 2) {
-        const reply = await groq.getFallbackReply(text || '', 'ASK_NAME');
-        await whatsapp.sendText(from, reply);
+    if (state.step === 'ASK_LANGUAGE') {
+      const lang = LANG_MAP[buttonId];
+      if (!lang) {
+        await whatsapp.sendButtons(from, LANGUAGE_PROMPT, LANGUAGE_BUTTONS);
         return;
       }
-      await sheets.setPendingState(from, { step: 'ASK_AGE', name: text.trim(), age: '', date: '' });
-      await whatsapp.sendText(from, `Dhanyawad, ${text.trim()}. Aata tumche vay (age) sanga.`);
+      const M = getMessages(lang);
+      await sheets.setPendingState(from, { step: 'ASK_NAME', name: '', age: '', date: '', slot: '', lang });
+      await whatsapp.sendText(from, M.welcomeAskName(clinicName));
+      return;
+    }
+
+    // From here on every step has a language already chosen.
+    const M = getMessages(state.lang);
+
+    if (state.step === 'ASK_NAME') {
+      if (!text || text.trim().length < 2) {
+        await whatsapp.sendText(from, M.invalidName);
+        return;
+      }
+      await sheets.setPendingState(from, {
+        step: 'ASK_AGE',
+        name: text.trim(),
+        age: '',
+        date: '',
+        slot: '',
+        lang: state.lang,
+      });
+      await whatsapp.sendText(from, M.askAge(text.trim()));
       return;
     }
 
     if (state.step === 'ASK_AGE') {
       const age = parseInt(text, 10);
       if (!text || isNaN(age) || age <= 0 || age > 120) {
-        const reply = await groq.getFallbackReply(text || '', 'ASK_AGE');
-        await whatsapp.sendText(from, reply);
+        await whatsapp.sendText(from, M.invalidAge);
         return;
       }
-      await sheets.setPendingState(from, { step: 'ASK_DATE', name: state.name, age: String(age), date: '' });
-      await whatsapp.sendButtons(from, 'Appointment kevha havi aahe?', [
-        { id: 'today', title: 'Aaj' },
-        { id: 'tomorrow', title: 'Udya' },
-      ]);
+      await sheets.setPendingState(from, {
+        step: 'ASK_DATE',
+        name: state.name,
+        age: String(age),
+        date: '',
+        slot: '',
+        lang: state.lang,
+      });
+      await whatsapp.sendButtons(from, M.askDateBody, M.dateButtons);
       return;
     }
 
     if (state.step === 'ASK_DATE') {
       let offsetDays = null;
-      if (buttonId === 'today' || /^aaj$/i.test(text || '')) offsetDays = 0;
-      else if (buttonId === 'tomorrow' || /^udya$/i.test(text || '')) offsetDays = 1;
+      if (buttonId === 'today') offsetDays = 0;
+      else if (buttonId === 'tomorrow') offsetDays = 1;
 
       if (offsetDays === null) {
-        // Didn't use the buttons / typed something else — re-show the buttons.
-        await whatsapp.sendButtons(from, 'Kripaya button dabun date select kara:', [
-          { id: 'today', title: 'Aaj' },
-          { id: 'tomorrow', title: 'Udya' },
-        ]);
+        // Didn't use the buttons / typed something else — re-show them.
+        await whatsapp.sendButtons(from, M.askDateRetry, M.dateButtons);
         return;
       }
 
       const dateStr = istDateString(offsetDays);
-      const token = await sheets.getNextAvailableToken(dateStr);
+      const sentToday = await sendSlotList(from, state, dateStr);
 
-      if (token === null && offsetDays === 0) {
-        // Today full -> offer tomorrow automatically.
+      if (!sentToday && offsetDays === 0) {
+        // Today full -> try tomorrow automatically.
         const tomorrowStr = istDateString(1);
-        const tomorrowToken = await sheets.getNextAvailableToken(tomorrowStr);
-        if (tomorrowToken === null) {
-          await whatsapp.sendText(from, 'Kshama kara, Aaj ani Udya donhi divas full aahet. Kripaya nantar sampark sadha.');
+        const sentTomorrow = await sendSlotList(from, state, tomorrowStr);
+        if (!sentTomorrow) {
+          await whatsapp.sendText(from, M.allFull);
           await sheets.clearPendingState(from);
-          return;
         }
-        await movePatientToPaymentStep(from, state, tomorrowStr, settings);
         return;
       }
 
-      if (token === null) {
-        await whatsapp.sendText(from, 'Kshama kara, ha divas full aahe. Kripaya nantar sampark sadha.');
+      if (!sentToday) {
+        await whatsapp.sendText(from, M.dayFull);
         await sheets.clearPendingState(from);
+      }
+      return;
+    }
+
+    if (state.step === 'ASK_SLOT') {
+      if (!buttonId) {
+        // Didn't pick from the list — re-send it for the same date.
+        const sent = await sendSlotList(from, state, state.date);
+        if (!sent) {
+          await whatsapp.sendText(from, M.noSlots);
+          await sheets.clearPendingState(from);
+        }
         return;
       }
 
-      await movePatientToPaymentStep(from, state, dateStr, settings);
+      const updatedState = { ...state, slot: buttonId };
+      await movePatientToPaymentStep(from, updatedState, settings);
       return;
     }
 
@@ -244,26 +311,21 @@ app.post('/webhook', async (req, res) => {
           await whatsapp.forwardImage(
             staffNumber,
             imageId,
-            `Payment screenshot - ${state.name} (${state.age}), date ${state.date}, phone ending ${from.slice(-4)}.\nReply "CONFIRM ${from.slice(-4)}" to confirm and issue a token.`
+            `Payment screenshot - ${state.name} (${state.age}), ${state.date} ${state.slot}, phone ending ${from.slice(-4)}.\nReply "CONFIRM ${from.slice(-4)}" to confirm and issue a token.`
           );
         } else {
           console.warn('No staff number configured (Settings tab / DOCTOR_WHATSAPP_NUMBER) — cannot forward screenshot.');
         }
-        await sheets.setPendingState(from, {
-          step: 'AWAITING_STAFF_CONFIRM',
-          name: state.name,
-          age: state.age,
-          date: state.date,
-        });
-        await whatsapp.sendText(from, 'Dhanyawad! Tumcha payment screenshot milala. Staff verify karat aahet, kripaya thoda vel thamba.');
+        await sheets.setPendingState(from, { ...state, step: 'AWAITING_STAFF_CONFIRM' });
+        await whatsapp.sendText(from, M.screenshotReceived);
       } else {
-        await whatsapp.sendText(from, 'Kripaya payment cha screenshot (photo) pathva.');
+        await whatsapp.sendText(from, M.askForScreenshot);
       }
       return;
     }
 
     if (state.step === 'AWAITING_STAFF_CONFIRM') {
-      await whatsapp.sendText(from, 'Amhi tumcha payment verify karat aahot. Kripaya thoda vel thamba, confirmation lavkarach yeil.');
+      await whatsapp.sendText(from, M.stillWaiting);
       return;
     }
   } catch (err) {
