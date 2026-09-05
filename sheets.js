@@ -111,7 +111,7 @@ async function getAvailableSlots(dateStr) {
   const capIdx = capacityTab.header.indexOf('Max Capacity');
   if (dateIdx === -1 || slotIdx === -1 || capIdx === -1) return [];
 
-  const slotRows = capacityTab.rows.filter((r) => r[dateIdx] === dateStr);
+  const slotRows = capacityTab.rows.filter((r) => (r[dateIdx] || '').trim() === dateStr.trim());
   if (slotRows.length === 0) return [];
 
   const bookingsTab = await readTab('Bookings');
@@ -120,12 +120,14 @@ async function getAvailableSlots(dateStr) {
 
   const results = [];
   for (const row of slotRows) {
-    const slot = row[slotIdx];
+    const slot = (row[slotIdx] || '').trim();
     const maxCap = parseInt(row[capIdx], 10) || 0;
     const booked =
       bDateIdx === -1 || bSlotIdx === -1
         ? 0
-        : bookingsTab.rows.filter((r) => r[bDateIdx] === dateStr && r[bSlotIdx] === slot).length;
+        : bookingsTab.rows.filter(
+            (r) => (r[bDateIdx] || '').trim() === dateStr.trim() && (r[bSlotIdx] || '').trim() === slot
+          ).length;
     const remaining = maxCap - booked;
     if (remaining > 0) results.push({ slot, remaining });
   }
@@ -148,7 +150,9 @@ async function getNextAvailableTokenForSlot(dateStr, slot) {
   const capIdx = capacityTab.header.indexOf('Max Capacity');
   if (dateIdx === -1 || slotIdx === -1 || capIdx === -1) return null;
 
-  const capRow = capacityTab.rows.find((r) => r[dateIdx] === dateStr && r[slotIdx] === slot);
+  const capRow = capacityTab.rows.find(
+    (r) => (r[dateIdx] || '').trim() === dateStr.trim() && (r[slotIdx] || '').trim() === slot.trim()
+  );
   if (!capRow) return null;
   const maxCap = parseInt(capRow[capIdx], 10) || 0;
 
@@ -158,10 +162,14 @@ async function getNextAvailableTokenForSlot(dateStr, slot) {
   if (bDateIdx === -1) return null;
 
   const bookedInSlot =
-    bSlotIdx === -1 ? 0 : bookingsTab.rows.filter((r) => r[bDateIdx] === dateStr && r[bSlotIdx] === slot).length;
+    bSlotIdx === -1
+      ? 0
+      : bookingsTab.rows.filter(
+          (r) => (r[bDateIdx] || '').trim() === dateStr.trim() && (r[bSlotIdx] || '').trim() === slot.trim()
+        ).length;
   if (bookedInSlot >= maxCap) return null;
 
-  const bookedInDay = bookingsTab.rows.filter((r) => r[bDateIdx] === dateStr).length;
+  const bookedInDay = bookingsTab.rows.filter((r) => (r[bDateIdx] || '').trim() === dateStr.trim()).length;
   return bookedInDay + 1;
 }
 
@@ -239,7 +247,7 @@ async function generateUpcomingSlots() {
   const { header, rows } = await readTab('Capacity');
   const dateIdx = header.indexOf('Date');
   const slotIdx = header.indexOf('Slot');
-  const existingKeys = new Set(rows.map((r) => `${r[dateIdx]}__${r[slotIdx]}`));
+  const existingKeys = new Set(rows.map((r) => `${(r[dateIdx] || '').trim()}__${(r[slotIdx] || '').trim()}`));
 
   const newRows = [];
   for (let d = 0; d < daysAhead; d++) {
