@@ -8,8 +8,8 @@
 //                "Booked Count" are informational only — the bot computes the
 //                actual booked count live from the Bookings tab instead of
 //                trusting a manually-editable counter.)
-//   Bookings  -> columns: Timestamp | Phone Number | Name | Age | Date | Token Number | Payment Status
-//   Pending   -> columns: Phone Number | Step | Name | Age | Date | Timestamp
+//   Bookings  -> columns: Timestamp | Phone Number | Name | Age | Date | Slot | Token Number | Payment Status
+//   Pending   -> columns: Phone Number | Step | Name | Age | Date | Slot | Lang | Timestamp
 //
 // NOTE: header names here must match the Sheet EXACTLY (including spaces) —
 // the code looks columns up by header text via indexOf(), not by position.
@@ -93,59 +93,84 @@ async function getSettings() {
   return settingsCache;
 }
 
-// ---------- Capacity ----------
+// ---------- Capacity (per date + time slot) ----------
 
-async function getCapacity(dateStr) {
-  const { header, rows } = await readTab('Capacity');
-  const dateIdx = header.indexOf('Date');
-  const capIdx = header.indexOf('Max Capacity');
-  if (dateIdx === -1 || capIdx === -1) return 0;
+// Returns every slot on a given date that still has room, e.g.
+// [{ slot: '10:00 AM', remaining: 2 }, { slot: '10:15 AM', remaining: 1 }]
+async function getAvailableSlots(dateStr) {
+  const capacityTab = await readTab('Capacity');
+  const dateIdx = capacityTab.header.indexOf('Date');
+  const slotIdx = capacityTab.header.indexOf('Slot');
+  const capIdx = capacityTab.header.indexOf('Max Capacity');
+  if (dateIdx === -1 || slotIdx === -1 || capIdx === -1) return [];
 
-  const exact = rows.find((r) => r[dateIdx] === dateStr);
-  if (exact) return parseInt(exact[capIdx], 10) || 0;
+  const slotRows = capacityTab.rows.filter((r) => r[dateIdx] === dateStr);
+  if (slotRows.length === 0) return [];
 
-  const fallback = rows.find((r) => r[dateIdx] === 'Default');
-  if (fallback) return parseInt(fallback[capIdx], 10) || 0;
+  const bookingsTab = await readTab('Bookings');
+  const bDateIdx = bookingsTab.header.indexOf('Date');
+  const bSlotIdx = bookingsTab.header.indexOf('Slot');
 
-  return 0;
+  const results = [];
+  for (const row of slotRows) {
+    const slot = row[slotIdx];
+    const maxCap = parseInt(row[capIdx], 10) || 0;
+    const booked =
+      bDateIdx === -1 || bSlotIdx === -1
+        ? 0
+        : bookingsTab.rows.filter((r) => r[bDateIdx] === dateStr && r[bSlotIdx] === slot).length;
+    const remaining = maxCap - booked;
+    if (remaining > 0) results.push({ slot, remaining });
+  }
+  return results;
 }
 
-async function getBookedCount(dateStr) {
-  const { header, rows } = await readTab('Bookings');
-  const dateIdx = header.indexOf('Date');
-  if (dateIdx === -1) return 0;
-  return rows.filter((r) => r[dateIdx] === dateStr).length;
-}
+// Returns the token number to assign if this exact date+slot still has
+// room, or null if it's full. The token itself is a same-day queue number
+// (count of ALL bookings that day, not just this slot) so patients get a
+// single sequential number for the day regardless of which time they picked.
+//
+// NOTE: like the old getNextAvailableToken, this only checks at the moment
+// it's called — it doesn't reserve a slot in advance. We call it once when
+// showing the slot list (to hide full slots) and again right when staff
+// confirms payment (to assign the real token). Fine at clinic scale.
+async function getNextAvailableTokenForSlot(dateStr, slot) {
+  const capacityTab = await readTab('Capacity');
+  const dateIdx = capacityTab.header.indexOf('Date');
+  const slotIdx = capacityTab.header.indexOf('Slot');
+  const capIdx = capacityTab.header.indexOf('Max Capacity');
+  if (dateIdx === -1 || slotIdx === -1 || capIdx === -1) return null;
 
-// Returns the next free token for a date, or null if the day is full.
-// NOTE: this only *checks* availability — it does not reserve a slot. We
-// call it once when the patient picks a date (just to avoid sending a
-// payment QR for a day that's already full), and again right when staff
-// confirms payment (to assign the actual token). A slot could in theory be
-// taken by someone else in between at clinic scale this is a non-issue —
-// only a handful of bookings happen per day.
-async function getNextAvailableToken(dateStr) {
-  const [capacity, booked] = await Promise.all([
-    getCapacity(dateStr),
-    getBookedCount(dateStr),
-  ]);
-  if (booked >= capacity) return null;
-  return booked + 1;
+  const capRow = capacityTab.rows.find((r) => r[dateIdx] === dateStr && r[slotIdx] === slot);
+  if (!capRow) return null;
+  const maxCap = parseInt(capRow[capIdx], 10) || 0;
+
+  const bookingsTab = await readTab('Bookings');
+  const bDateIdx = bookingsTab.header.indexOf('Date');
+  const bSlotIdx = bookingsTab.header.indexOf('Slot');
+  if (bDateIdx === -1) return null;
+
+  const bookedInSlot =
+    bSlotIdx === -1 ? 0 : bookingsTab.rows.filter((r) => r[bDateIdx] === dateStr && r[bSlotIdx] === slot).length;
+  if (bookedInSlot >= maxCap) return null;
+
+  const bookedInDay = bookingsTab.rows.filter((r) => r[bDateIdx] === dateStr).length;
+  return bookedInDay + 1;
 }
 
 // ---------- Bookings ----------
 
-async function appendBooking({ name, age, date, token, phone, paymentStatus }) {
+async function appendBooking({ name, age, date, slot, token, phone, paymentStatus }) {
   const sheets = await getSheetsClient();
   // Column order here MUST match the actual Bookings tab:
-  // Timestamp | Phone Number | Name | Age | Date | Token Number | Payment Status
+  // Timestamp | Phone Number | Name | Age | Date | Slot | Token Number | Payment Status
   await sheets.spreadsheets.values.append({
     spreadsheetId: SHEET_ID,
-    range: 'Bookings!A:G',
+    range: 'Bookings!A:H',
     valueInputOption: 'USER_ENTERED',
     insertDataOption: 'INSERT_ROWS',
     requestBody: {
-      values: [[new Date().toISOString(), `'${phone}`, name, age, date, token, paymentStatus || 'Paid']],
+      values: [[new Date().toISOString(), `'${phone}`, name, age, date, slot, token, paymentStatus || 'Paid']],
     },
   });
 }
@@ -166,6 +191,8 @@ async function getPendingState(phone) {
     name: obj.Name,
     age: obj.Age,
     date: obj.Date,
+    slot: obj.Slot,
+    lang: obj.Lang,
     updatedAt: obj.Timestamp,
   };
 }
@@ -183,6 +210,8 @@ async function setPendingState(phone, data) {
     data.name || '',
     data.age || '',
     data.date || '',
+    data.slot || '',
+    data.lang || '',
     new Date().toISOString(),
   ];
 
@@ -191,7 +220,7 @@ async function setPendingState(phone, data) {
   if (existingIndex === -1) {
     await sheets.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
-      range: 'Pending!A:F',
+      range: 'Pending!A:H',
       valueInputOption: 'USER_ENTERED',
       insertDataOption: 'INSERT_ROWS',
       requestBody: { values: [newRow] },
@@ -201,7 +230,7 @@ async function setPendingState(phone, data) {
     const sheetRowNumber = existingIndex + 2;
     await sheets.spreadsheets.values.update({
       spreadsheetId: SHEET_ID,
-      range: `Pending!A${sheetRowNumber}:F${sheetRowNumber}`,
+      range: `Pending!A${sheetRowNumber}:H${sheetRowNumber}`,
       valueInputOption: 'USER_ENTERED',
       requestBody: { values: [newRow] },
     });
@@ -212,7 +241,7 @@ async function clearPendingState(phone) {
   // Simplest reliable option with the Sheets API without deleting rows
   // (which would shift every other row's index mid-use): mark it DONE.
   // Any DONE / missing row is treated as "no active conversation".
-  await setPendingState(phone, { step: 'DONE', name: '', age: '', date: '' });
+  await setPendingState(phone, { step: 'DONE', name: '', age: '', date: '', slot: '', lang: '' });
 }
 
 // Used when staff replies "CONFIRM 9876" — finds the pending row whose
@@ -238,14 +267,15 @@ async function findPendingByLastDigits(lastDigits, expectedStep) {
     name: obj.Name,
     age: obj.Age,
     date: obj.Date,
+    slot: obj.Slot,
+    lang: obj.Lang,
   };
 }
 
 module.exports = {
   getSettings,
-  getCapacity,
-  getBookedCount,
-  getNextAvailableToken,
+  getAvailableSlots,
+  getNextAvailableTokenForSlot,
   appendBooking,
   getPendingState,
   setPendingState,
