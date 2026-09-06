@@ -130,6 +130,34 @@ async function sendUpiQr(to, { upiId, amount, clinicName, caption }) {
   await sendImageByMediaId(to, mediaId, caption);
 }
 
+// Sends an interactive "button" message with an IMAGE header — used to
+// forward a patient's payment screenshot to staff along with Confirm/Hold
+// buttons, so they can tap instead of typing "CONFIRM 1234" by hand.
+// buttons: [{ id: 'confirm_9876', title: '✅ Confirm' }, { id: 'hold_9876', title: '⏳ Hold' }]
+// Max 3 buttons, each title <=20 chars (Meta's limit).
+async function forwardImageWithButtons(to, mediaId, bodyText, buttons) {
+  await client().post(
+    '/messages',
+    {
+      messaging_product: 'whatsapp',
+      to,
+      type: 'interactive',
+      interactive: {
+        type: 'button',
+        header: { type: 'image', image: { id: mediaId } },
+        body: { text: bodyText },
+        action: {
+          buttons: buttons.map((b) => ({
+            type: 'reply',
+            reply: { id: b.id, title: b.title },
+          })),
+        },
+      },
+    },
+    { headers: { 'Content-Type': 'application/json' } }
+  );
+}
+
 // Re-sends media the patient already sent us (e.g. a payment screenshot) to
 // another number (staff/doctor). Media ids from an incoming message stay
 // valid within the same WhatsApp Business Account for a while, so normally
@@ -186,5 +214,6 @@ module.exports = {
   sendList,
   sendUpiQr,
   forwardImage,
+  forwardImageWithButtons,
   parseIncomingMessage,
 };
