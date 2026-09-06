@@ -8,8 +8,8 @@
 //                "Booked Count" are informational only — the bot computes the
 //                actual booked count live from the Bookings tab instead of
 //                trusting a manually-editable counter.)
-//   Bookings  -> columns: Timestamp | Phone Number | Name | Age | Date | Slot | Token Number | Payment Status
-//   Pending   -> columns: Phone Number | Step | Name | Age | Date | Slot | Lang | Timestamp
+//   Bookings  -> columns: Timestamp | Phone Number | Name | Age | Reason | Date | Slot | Token Number | Payment Status | Visit Type
+//   Pending   -> columns: Phone Number | Step | Name | Age | Reason | Date | Slot | Lang | Timestamp
 //
 // NOTE: header names here must match the Sheet EXACTLY (including spaces) —
 // the code looks columns up by header text via indexOf(), not by position.
@@ -341,13 +341,13 @@ async function generateUpcomingSlots() {
 
 // ---------- Bookings ----------
 
-async function appendBooking({ name, age, date, slot, token, phone, paymentStatus, visitType }) {
+async function appendBooking({ name, age, reason, date, slot, token, phone, paymentStatus, visitType }) {
   const sheets = await getSheetsClient();
   // Column order here MUST match the actual Bookings tab:
-  // Timestamp | Phone Number | Name | Age | Date | Slot | Token Number | Payment Status | Visit Type
+  // Timestamp | Phone Number | Name | Age | Reason | Date | Slot | Token Number | Payment Status | Visit Type
   await sheets.spreadsheets.values.append({
     spreadsheetId: SHEET_ID,
-    range: 'Bookings!A:I',
+    range: 'Bookings!A:J',
     valueInputOption: 'USER_ENTERED',
     insertDataOption: 'INSERT_ROWS',
     requestBody: {
@@ -357,6 +357,7 @@ async function appendBooking({ name, age, date, slot, token, phone, paymentStatu
           `'${phone}`,
           name,
           age,
+          reason || '',
           date,
           slot,
           token,
@@ -383,6 +384,7 @@ async function getPendingState(phone) {
     step: obj.Step,
     name: obj.Name,
     age: obj.Age,
+    reason: obj.Reason,
     date: obj.Date,
     slot: obj.Slot,
     lang: obj.Lang,
@@ -402,6 +404,7 @@ async function setPendingState(phone, data) {
     data.step || '',
     data.name || '',
     data.age || '',
+    data.reason || '',
     data.date || '',
     data.slot || '',
     data.lang || '',
@@ -413,7 +416,7 @@ async function setPendingState(phone, data) {
   if (existingIndex === -1) {
     await sheets.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
-      range: 'Pending!A:H',
+      range: 'Pending!A:I',
       valueInputOption: 'USER_ENTERED',
       insertDataOption: 'INSERT_ROWS',
       requestBody: { values: [newRow] },
@@ -423,7 +426,7 @@ async function setPendingState(phone, data) {
     const sheetRowNumber = existingIndex + 2;
     await sheets.spreadsheets.values.update({
       spreadsheetId: SHEET_ID,
-      range: `Pending!A${sheetRowNumber}:H${sheetRowNumber}`,
+      range: `Pending!A${sheetRowNumber}:I${sheetRowNumber}`,
       valueInputOption: 'USER_ENTERED',
       requestBody: { values: [newRow] },
     });
@@ -434,7 +437,7 @@ async function clearPendingState(phone) {
   // Simplest reliable option with the Sheets API without deleting rows
   // (which would shift every other row's index mid-use): mark it DONE.
   // Any DONE / missing row is treated as "no active conversation".
-  await setPendingState(phone, { step: 'DONE', name: '', age: '', date: '', slot: '', lang: '' });
+  await setPendingState(phone, { step: 'DONE', name: '', age: '', reason: '', date: '', slot: '', lang: '' });
 }
 
 // Used when staff replies "CONFIRM 9876" — finds the pending row whose
@@ -459,16 +462,39 @@ async function findPendingByLastDigits(lastDigits, expectedStep) {
     step: obj.Step,
     name: obj.Name,
     age: obj.Age,
+    reason: obj.Reason,
     date: obj.Date,
     slot: obj.Slot,
     lang: obj.Lang,
   };
 }
 
+// Looks up a single confirmed booking for the case-paper page — matched by
+// phone + date + token (all three together, since a patient could in theory
+// book more than once on the same day).
+async function findBooking({ phone, date, token }) {
+  const { header, rows } = await readTab('Bookings');
+  const phoneIdx = header.indexOf('Phone Number');
+  const dateIdx = header.indexOf('Date');
+  const tokenIdx = header.indexOf('Token Number');
+  if (phoneIdx === -1 || dateIdx === -1 || tokenIdx === -1) return null;
+
+  const match = rows.find(
+    (r) =>
+      stripQuote(r[phoneIdx]) === phone &&
+      (r[dateIdx] || '').trim() === date.trim() &&
+      String(r[tokenIdx]).trim() === String(token).trim()
+  );
+  if (!match) return null;
+
+  return rowToObject(header, match);
+}
+
 module.exports = {
   getSettings,
   getVisitType,
   getLastVisitDate,
+  findBooking,
   getAvailableSlots,
   getNextAvailableTokenForSlot,
   generateUpcomingSlots,
