@@ -40,8 +40,8 @@ const TEMPLATES = {
     askSlotButtonLabel: 'Vel nivda',
     slotsLeftLabel: 'shillak',
     noSlots: '😔 Kshama kara, ya divashi ekahi vel shillak nahi. Kripaya doosra divas nivda.',
-    paymentCaption: (fee, upiId, clinic) =>
-      `🧾 *${clinic}*\n\n💳 Appointment Fee: *Rs ${fee}*\nUPI ID: *${upiId}*\n\nQR scan karun payment kara, ani payment cha *screenshot* ithech pathva.`,
+    paymentCaption: (fee, upiId, clinic, visitType) =>
+      `🧾 *${clinic}*\n${visitType === 'New' ? '🆕 New Patient (naveen case paper)' : '🔁 Follow-up Patient'}\n\n💳 Appointment Fee: *Rs ${fee}*\nUPI ID: *${upiId}*\n\nQR scan karun payment kara, ani payment cha *screenshot* ithech pathva.`,
     screenshotReceived: '✅ Dhanyawad! Tumcha payment screenshot milala.\nStaff verify karat aahet, kripaya thoda vel thamba.',
     askForScreenshot: '📸 Kripaya payment cha screenshot (photo) pathva.',
     stillWaiting: '⏳ Amhi tumcha payment verify karat aahot. Kripaya thoda vel thamba, confirmation lavkarach yeil.',
@@ -68,8 +68,8 @@ const TEMPLATES = {
     askSlotButtonLabel: 'Samay chunein',
     slotsLeftLabel: 'bache hain',
     noSlots: '😔 Maaf kijiye, is din koi samay khali nahi hai. Kripya doosra din chunein.',
-    paymentCaption: (fee, upiId, clinic) =>
-      `🧾 *${clinic}*\n\n💳 Appointment Fee: *Rs ${fee}*\nUPI ID: *${upiId}*\n\nQR scan karke payment karein, aur payment ka *screenshot* yahin bhejein.`,
+    paymentCaption: (fee, upiId, clinic, visitType) =>
+      `🧾 *${clinic}*\n${visitType === 'New' ? '🆕 New Patient (naya case paper)' : '🔁 Follow-up Patient'}\n\n💳 Appointment Fee: *Rs ${fee}*\nUPI ID: *${upiId}*\n\nQR scan karke payment karein, aur payment ka *screenshot* yahin bhejein.`,
     screenshotReceived: '✅ Dhanyawad! Aapka payment screenshot mil gaya.\nStaff verify kar rahe hain, kripya thoda intezaar karein.',
     askForScreenshot: '📸 Kripya payment ka screenshot (photo) bhejein.',
     stillWaiting: '⏳ Hum aapka payment verify kar rahe hain. Kripya thoda intezaar karein, confirmation jald aayega.',
@@ -96,8 +96,8 @@ const TEMPLATES = {
     askSlotButtonLabel: 'Choose time',
     slotsLeftLabel: 'left',
     noSlots: '😔 Sorry, no slots are left for this day. Please choose another day.',
-    paymentCaption: (fee, upiId, clinic) =>
-      `🧾 *${clinic}*\n\n💳 Appointment Fee: *Rs ${fee}*\nUPI ID: *${upiId}*\n\nScan the QR to pay, and send the payment *screenshot* here.`,
+    paymentCaption: (fee, upiId, clinic, visitType) =>
+      `🧾 *${clinic}*\n${visitType === 'New' ? '🆕 New Patient (new case paper)' : '🔁 Follow-up Patient'}\n\n💳 Appointment Fee: *Rs ${fee}*\nUPI ID: *${upiId}*\n\nScan the QR to pay, and send the payment *screenshot* here.`,
     screenshotReceived: '✅ Thank you! We received your payment screenshot.\nOur staff is verifying it, please wait a moment.',
     askForScreenshot: '📸 Please send a screenshot (photo) of your payment.',
     stillWaiting: "⏳ We're still verifying your payment. Please wait a bit, confirmation will arrive soon.",
