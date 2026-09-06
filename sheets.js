@@ -85,6 +85,9 @@ async function getSettings() {
 
   settingsCache = {
     feeAmount: map['Appointment Fee'] || '0',
+    newPatientFee: map['New Patient Fee'] || map['Appointment Fee'] || '0',
+    followUpFee: map['Follow-up Fee'] || map['Appointment Fee'] || '0',
+    caseValidityDays: map['Case Paper Validity Days'] || '30',
     upiId: map['UPI ID'] || '',
     staffNumber: (map['Staff WhatsApp Number'] || '').replace(/\D/g, ''),
     clinicName: map['Clinic Name'] || 'the clinic',
@@ -99,6 +102,41 @@ async function getSettings() {
   };
   settingsCacheAt = now;
   return settingsCache;
+}
+
+// ---------- New vs Follow-up patient detection ----------
+
+// Returns the most recent booking date (YYYY-MM-DD string) for this phone
+// number, or null if they've never booked before. Used to decide whether
+// someone is a "New" patient (needs a fresh case paper) or "Follow-up"
+// (case paper from a recent visit is still valid).
+async function getLastVisitDate(phone) {
+  const { header, rows } = await readTab('Bookings');
+  const phoneIdx = header.indexOf('Phone Number');
+  const dateIdx = header.indexOf('Date');
+  if (phoneIdx === -1 || dateIdx === -1) return null;
+
+  const matches = rows.filter((r) => stripQuote(r[phoneIdx]) === phone);
+  if (matches.length === 0) return null;
+
+  const dates = matches.map((r) => r[dateIdx]).filter(Boolean).sort();
+  return dates.length > 0 ? dates[dates.length - 1] : null;
+}
+
+// "New" or "Follow-up", based on Case Paper Validity Days from Settings.
+async function getVisitType(phone) {
+  const lastVisit = await getLastVisitDate(phone);
+  if (!lastVisit) return 'New';
+
+  const settings = await getSettings();
+  const validityDays = parseInt(settings.caseValidityDays, 10) || 30;
+
+  const last = new Date(`${lastVisit}T00:00:00`);
+  const today = new Date(`${istDateStringLocal(0)}T00:00:00`);
+  if (isNaN(last.getTime())) return 'New'; // malformed date in the sheet — fail safe to "New"
+
+  const daysSince = Math.round((today - last) / (1000 * 60 * 60 * 24));
+  return daysSince <= validityDays ? 'Follow-up' : 'New';
 }
 
 // ---------- Capacity (per date + time slot) ----------
@@ -303,17 +341,29 @@ async function generateUpcomingSlots() {
 
 // ---------- Bookings ----------
 
-async function appendBooking({ name, age, date, slot, token, phone, paymentStatus }) {
+async function appendBooking({ name, age, date, slot, token, phone, paymentStatus, visitType }) {
   const sheets = await getSheetsClient();
   // Column order here MUST match the actual Bookings tab:
-  // Timestamp | Phone Number | Name | Age | Date | Slot | Token Number | Payment Status
+  // Timestamp | Phone Number | Name | Age | Date | Slot | Token Number | Payment Status | Visit Type
   await sheets.spreadsheets.values.append({
     spreadsheetId: SHEET_ID,
-    range: 'Bookings!A:H',
+    range: 'Bookings!A:I',
     valueInputOption: 'USER_ENTERED',
     insertDataOption: 'INSERT_ROWS',
     requestBody: {
-      values: [[new Date().toISOString(), `'${phone}`, name, age, date, slot, token, paymentStatus || 'Paid']],
+      values: [
+        [
+          new Date().toISOString(),
+          `'${phone}`,
+          name,
+          age,
+          date,
+          slot,
+          token,
+          paymentStatus || 'Paid',
+          visitType || '',
+        ],
+      ],
     },
   });
 }
@@ -417,6 +467,8 @@ async function findPendingByLastDigits(lastDigits, expectedStep) {
 
 module.exports = {
   getSettings,
+  getVisitType,
+  getLastVisitDate,
   getAvailableSlots,
   getNextAvailableTokenForSlot,
   generateUpcomingSlots,
