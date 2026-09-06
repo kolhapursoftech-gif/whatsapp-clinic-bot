@@ -212,17 +212,28 @@ app.post('/webhook', async (req, res) => {
     const staffNumber = settings.staffNumber || (DOCTOR_NUMBER || '').replace(/\D/g, '');
     const clinicName = settings.clinicName || CLINIC_NAME_FALLBACK;
 
-    // ---- Staff replying "CONFIRM 9876" to approve a payment screenshot ----
+    // ---- Staff replying to approve/hold a payment screenshot ----
+    // Accepts either typing "CONFIRM 9876" OR tapping the Confirm/Hold
+    // buttons sent alongside the forwarded screenshot.
     if (staffNumber && from === staffNumber) {
       if (text && CONFIRM_REGEX.test(text)) {
         const lastDigits = text.match(CONFIRM_REGEX)[1];
         await handleStaffConfirm(lastDigits, staffNumber, clinicName);
+      } else if (buttonId && buttonId.startsWith('confirm_')) {
+        const lastDigits = buttonId.replace('confirm_', '');
+        await handleStaffConfirm(lastDigits, staffNumber, clinicName);
+      } else if (buttonId && buttonId.startsWith('hold_')) {
+        const lastDigits = buttonId.replace('hold_', '');
+        await whatsapp.sendText(
+          staffNumber,
+          `⏳ Thik aahe. Jevha khatri hoil tevha *Confirm* button dabaa, kiva "CONFIRM ${lastDigits}" pathva.`
+        );
       } else {
         // Any other message from the staff number (typos, "ok", forwarded
         // media, etc.) is ignored here instead of falling through to the
         // patient booking flow below — otherwise the bot would mistakenly
         // start asking the staff member for their name/age.
-        console.log(`Ignoring non-CONFIRM message from staff number: "${text}"`);
+        console.log(`Ignoring non-actionable message from staff number: "${text}" buttonId=${buttonId}`);
       }
       return;
     }
@@ -338,10 +349,15 @@ app.post('/webhook', async (req, res) => {
     if (state.step === 'AWAITING_PAYMENT_SCREENSHOT') {
       if (imageId) {
         if (staffNumber) {
-          await whatsapp.forwardImage(
+          const last4 = from.slice(-4);
+          await whatsapp.forwardImageWithButtons(
             staffNumber,
             imageId,
-            `Payment screenshot - ${state.name} (${state.age}), ${state.date} ${state.slot}, phone ending ${from.slice(-4)}.\nReply "CONFIRM ${from.slice(-4)}" to confirm and issue a token.`
+            `📥 *Payment Screenshot*\n\n👤 ${state.name} (${state.age})\n📅 ${state.date}  🕒 ${state.slot}\n📱 ...${last4}`,
+            [
+              { id: `confirm_${last4}`, title: '✅ Confirm' },
+              { id: `hold_${last4}`, title: '⏳ Hold' },
+            ]
           );
         } else {
           console.warn('No staff number configured (Settings tab / DOCTOR_WHATSAPP_NUMBER) — cannot forward screenshot.');
