@@ -28,6 +28,8 @@ const TEMPLATES = {
       `👋 *Namaskar!*\n*${clinic}* madhe swagat aahe.\n\nAppointment book karayla, kripaya tumche *purna naav* sanga.`,
     askAge: (name) => `Dhanyawad, *${name}*! 🙏\nAata tumche *vay (age)* sanga.`,
     invalidAge: '❗ Kripaya barobar vay (number madhe) sanga.',
+    askReason: '🩺 Kashasathi appointment havi aahe? Thodkyat sanga (udah. taap, dukhne, checkup).',
+    invalidReason: '❗ Kripaya thodkyat karan sanga (kimman 2 akshar).',
     askDateBody: '📅 Appointment kevha havi aahe?',
     dateButtons: [
       { id: 'today', title: '📅 Aaj' },
@@ -56,6 +58,8 @@ const TEMPLATES = {
       `👋 *Namaste!*\n*${clinic}* mein aapka swagat hai.\n\nAppointment book karne ke liye, kripya apna *poora naam* bataiye.`,
     askAge: (name) => `Dhanyawad, *${name}*! 🙏\nAb apni *umar (age)* bataiye.`,
     invalidAge: '❗ Kripya sahi umar (number mein) bataiye.',
+    askReason: '🩺 Appointment kis liye chahiye? Sankshep mein bataiye (jaise, bukhar, dard, checkup).',
+    invalidReason: '❗ Kripya sankshep mein karan bataiye (kam se kam 2 akshar).',
     askDateBody: '📅 Appointment kab chahiye?',
     dateButtons: [
       { id: 'today', title: '📅 Aaj' },
@@ -84,6 +88,8 @@ const TEMPLATES = {
       `👋 *Hello!*\nWelcome to *${clinic}*.\n\nTo book an appointment, please tell us your *full name*.`,
     askAge: (name) => `Thank you, *${name}*! 🙏\nNow please tell us your *age*.`,
     invalidAge: '❗ Please enter a valid age (a number).',
+    askReason: '🩺 What is the appointment for? Please briefly describe (e.g. fever, pain, checkup).',
+    invalidReason: '❗ Please enter a brief reason (at least 2 letters).',
     askDateBody: '📅 When would you like your appointment?',
     dateButtons: [
       { id: 'today', title: '📅 Today' },
