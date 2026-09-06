@@ -79,6 +79,9 @@ async function sendSlotList(phone, state, dateStr) {
 
 async function movePatientToPaymentStep(phone, state, settingsObj) {
   const M = getMessages(state.lang);
+  const visitType = await sheets.getVisitType(phone);
+  const fee = visitType === 'Follow-up' ? settingsObj.followUpFee : settingsObj.newPatientFee;
+
   await sheets.setPendingState(phone, {
     step: 'AWAITING_PAYMENT_SCREENSHOT',
     name: state.name,
@@ -89,13 +92,15 @@ async function movePatientToPaymentStep(phone, state, settingsObj) {
   });
   await whatsapp.sendUpiQr(phone, {
     upiId: settingsObj.upiId,
-    amount: settingsObj.feeAmount,
+    amount: fee,
     clinicName: settingsObj.clinicName,
-    caption: M.paymentCaption(settingsObj.feeAmount, settingsObj.upiId, settingsObj.clinicName),
+    caption: M.paymentCaption(fee, settingsObj.upiId, settingsObj.clinicName, visitType),
   });
 }
 
 async function finalizeBooking(phone, name, age, dateStr, slot, token, opts = {}) {
+  const visitType = await sheets.getVisitType(phone);
+
   await sheets.appendBooking({
     name,
     age,
@@ -104,6 +109,7 @@ async function finalizeBooking(phone, name, age, dateStr, slot, token, opts = {}
     token,
     phone,
     paymentStatus: opts.paymentStatus || 'Paid',
+    visitType,
   });
   await sheets.clearPendingState(phone);
 
@@ -117,7 +123,7 @@ async function finalizeBooking(phone, name, age, dateStr, slot, token, opts = {}
   if (notifyNumber) {
     await whatsapp.sendText(
       notifyNumber,
-      `Naveen Booking: ${name} (${age}) - Token #${token} - ${dateStr} ${slot} (Payment: ${opts.paymentStatus || 'Paid'})`
+      `Naveen Booking: ${name} (${age}) - Token #${token} - ${dateStr} ${slot} - ${visitType} (Payment: ${opts.paymentStatus || 'Paid'})`
     );
   }
 }
