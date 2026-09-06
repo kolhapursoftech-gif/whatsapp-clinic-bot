@@ -119,7 +119,7 @@ async function getLastVisitDate(phone) {
   const matches = rows.filter((r) => stripQuote(r[phoneIdx]) === phone);
   if (matches.length === 0) return null;
 
-  const dates = matches.map((r) => r[dateIdx]).filter(Boolean).sort();
+  const dates = matches.map((r) => stripQuote(r[dateIdx])).filter(Boolean).sort();
   return dates.length > 0 ? dates[dates.length - 1] : null;
 }
 
@@ -153,7 +153,7 @@ async function getAvailableSlots(dateStr) {
   const capIdx = capacityTab.header.indexOf('Max Capacity');
   if (dateIdx === -1 || slotIdx === -1 || capIdx === -1) return [];
 
-  const slotRows = capacityTab.rows.filter((r) => (r[dateIdx] || '').trim() === dateStr.trim());
+  const slotRows = capacityTab.rows.filter((r) => stripQuote(r[dateIdx]).trim() === dateStr.trim());
   if (slotRows.length === 0) return [];
 
   const bookingsTab = await readTab('Bookings');
@@ -168,7 +168,7 @@ async function getAvailableSlots(dateStr) {
 
   const results = [];
   for (const row of slotRows) {
-    const slot = (row[slotIdx] || '').trim();
+    const slot = stripQuote(row[slotIdx]).trim();
 
     if (isToday) {
       const slotMinutes = parseTimeToMinutes(slot);
@@ -182,7 +182,7 @@ async function getAvailableSlots(dateStr) {
       bDateIdx === -1 || bSlotIdx === -1
         ? 0
         : bookingsTab.rows.filter(
-            (r) => (r[bDateIdx] || '').trim() === dateStr.trim() && (r[bSlotIdx] || '').trim() === slot
+            (r) => stripQuote(r[bDateIdx]).trim() === dateStr.trim() && stripQuote(r[bSlotIdx]).trim() === slot
           ).length;
     const remaining = maxCap - booked;
     if (remaining > 0) results.push({ slot, remaining });
@@ -207,7 +207,7 @@ async function getNextAvailableTokenForSlot(dateStr, slot) {
   if (dateIdx === -1 || slotIdx === -1 || capIdx === -1) return null;
 
   const capRow = capacityTab.rows.find(
-    (r) => (r[dateIdx] || '').trim() === dateStr.trim() && (r[slotIdx] || '').trim() === slot.trim()
+    (r) => stripQuote(r[dateIdx]).trim() === dateStr.trim() && stripQuote(r[slotIdx]).trim() === slot.trim()
   );
   if (!capRow) return null;
   const maxCap = parseInt(capRow[capIdx], 10) || 0;
@@ -221,11 +221,11 @@ async function getNextAvailableTokenForSlot(dateStr, slot) {
     bSlotIdx === -1
       ? 0
       : bookingsTab.rows.filter(
-          (r) => (r[bDateIdx] || '').trim() === dateStr.trim() && (r[bSlotIdx] || '').trim() === slot.trim()
+          (r) => stripQuote(r[bDateIdx]).trim() === dateStr.trim() && stripQuote(r[bSlotIdx]).trim() === slot.trim()
         ).length;
   if (bookedInSlot >= maxCap) return null;
 
-  const bookedInDay = bookingsTab.rows.filter((r) => (r[bDateIdx] || '').trim() === dateStr.trim()).length;
+  const bookedInDay = bookingsTab.rows.filter((r) => stripQuote(r[bDateIdx]).trim() === dateStr.trim()).length;
   return bookedInDay + 1;
 }
 
@@ -312,7 +312,7 @@ async function generateUpcomingSlots() {
   const { header, rows } = await readTab('Capacity');
   const dateIdx = header.indexOf('Date');
   const slotIdx = header.indexOf('Slot');
-  const existingKeys = new Set(rows.map((r) => `${(r[dateIdx] || '').trim()}__${(r[slotIdx] || '').trim()}`));
+  const existingKeys = new Set(rows.map((r) => `${stripQuote(r[dateIdx]).trim()}__${stripQuote(r[slotIdx]).trim()}`));
 
   const newRows = [];
   for (let d = 0; d < daysAhead; d++) {
@@ -320,7 +320,7 @@ async function generateUpcomingSlots() {
     for (const slot of dailySlots) {
       const key = `${dateStr}__${slot}`;
       if (!existingKeys.has(key)) {
-        newRows.push([dateStr, slot, maxCap, 0]);
+        newRows.push([`'${dateStr}`, `'${slot}`, maxCap, 0]);
       }
     }
   }
@@ -345,6 +345,11 @@ async function appendBooking({ name, age, reason, date, slot, token, phone, paym
   const sheets = await getSheetsClient();
   // Column order here MUST match the actual Bookings tab:
   // Timestamp | Phone Number | Name | Age | Reason | Date | Slot | Token Number | Payment Status | Visit Type
+  //
+  // Date and Slot are written with a leading apostrophe (same trick as
+  // phone numbers) to STOP Google Sheets from auto-converting "2026-09-05"
+  // into a real Date type (which then displays as a serial number like
+  // 46270 and can never text-match what the bot compares against).
   await sheets.spreadsheets.values.append({
     spreadsheetId: SHEET_ID,
     range: 'Bookings!A:J',
@@ -358,8 +363,8 @@ async function appendBooking({ name, age, reason, date, slot, token, phone, paym
           name,
           age,
           reason || '',
-          date,
-          slot,
+          `'${date}`,
+          `'${slot}`,
           token,
           paymentStatus || 'Paid',
           visitType || '',
@@ -385,8 +390,8 @@ async function getPendingState(phone) {
     name: obj.Name,
     age: obj.Age,
     reason: obj.Reason,
-    date: obj.Date,
-    slot: obj.Slot,
+    date: stripQuote(obj.Date),
+    slot: stripQuote(obj.Slot),
     lang: obj.Lang,
     updatedAt: obj.Timestamp,
   };
@@ -405,8 +410,8 @@ async function setPendingState(phone, data) {
     data.name || '',
     data.age || '',
     data.reason || '',
-    data.date || '',
-    data.slot || '',
+    data.date ? `'${data.date}` : '',
+    data.slot ? `'${data.slot}` : '',
     data.lang || '',
     new Date().toISOString(),
   ];
@@ -463,8 +468,8 @@ async function findPendingByLastDigits(lastDigits, expectedStep) {
     name: obj.Name,
     age: obj.Age,
     reason: obj.Reason,
-    date: obj.Date,
-    slot: obj.Slot,
+    date: stripQuote(obj.Date),
+    slot: stripQuote(obj.Slot),
     lang: obj.Lang,
   };
 }
@@ -482,12 +487,18 @@ async function findBooking({ phone, date, token }) {
   const match = rows.find(
     (r) =>
       stripQuote(r[phoneIdx]) === phone &&
-      (r[dateIdx] || '').trim() === date.trim() &&
+      stripQuote(r[dateIdx]).trim() === date.trim() &&
       String(r[tokenIdx]).trim() === String(token).trim()
   );
   if (!match) return null;
 
-  return rowToObject(header, match);
+  const obj = rowToObject(header, match);
+  // Defensive strip in case any stray leading apostrophes are ever visible
+  // in the returned values (shouldn't happen, but keeps the case-paper page
+  // clean either way).
+  if (obj.Date) obj.Date = stripQuote(obj.Date);
+  if (obj.Slot) obj.Slot = stripQuote(obj.Slot);
+  return obj;
 }
 
 module.exports = {
