@@ -17,6 +17,16 @@ const TRIGGER_SECRET = process.env.TRIGGER_SECRET;
 const CONFIRM_REGEX = /^CONFIRM\s+(\d{3,4})$/i;
 const LANG_MAP = { lang_mr: 'mr', lang_hi: 'hi', lang_en: 'en' };
 
+// Render sets RENDER_EXTERNAL_URL automatically on most plans. If it's not
+// present for your service, set APP_BASE_URL yourself in the environment
+// variables to your app's actual URL, e.g. https://your-app.onrender.com
+const APP_BASE_URL = (process.env.APP_BASE_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
+
+function buildCasePaperLink({ phone, date, token }) {
+  const params = new URLSearchParams({ secret: TRIGGER_SECRET || '', phone, date, token: String(token) });
+  return `${APP_BASE_URL}/case-paper?${params.toString()}`;
+}
+
 // ---------- date helpers (Asia/Kolkata) ----------
 
 function istDateString(offsetDays = 0) {
@@ -47,7 +57,15 @@ app.get('/webhook', (req, res) => {
 // ---------- helpers shared by the missed-call trigger and the webhook handler ----------
 
 async function startConversation(phone) {
-  await sheets.setPendingState(phone, { step: 'ASK_LANGUAGE', name: '', age: '', date: '', slot: '', lang: '' });
+  await sheets.setPendingState(phone, {
+    step: 'ASK_LANGUAGE',
+    name: '',
+    age: '',
+    reason: '',
+    date: '',
+    slot: '',
+    lang: '',
+  });
   await whatsapp.sendButtons(phone, LANGUAGE_PROMPT, LANGUAGE_BUTTONS);
 }
 
@@ -69,6 +87,7 @@ async function sendSlotList(phone, state, dateStr) {
     step: 'ASK_SLOT',
     name: state.name,
     age: state.age,
+    reason: state.reason,
     date: dateStr,
     lang: state.lang,
   });
@@ -86,6 +105,7 @@ async function movePatientToPaymentStep(phone, state, settingsObj) {
     step: 'AWAITING_PAYMENT_SCREENSHOT',
     name: state.name,
     age: state.age,
+    reason: state.reason,
     date: state.date,
     slot: state.slot,
     lang: state.lang,
@@ -98,12 +118,13 @@ async function movePatientToPaymentStep(phone, state, settingsObj) {
   });
 }
 
-async function finalizeBooking(phone, name, age, dateStr, slot, token, opts = {}) {
+async function finalizeBooking(phone, name, age, reason, dateStr, slot, token, opts = {}) {
   const visitType = await sheets.getVisitType(phone);
 
   await sheets.appendBooking({
     name,
     age,
+    reason,
     date: dateStr,
     slot,
     token,
@@ -121,9 +142,10 @@ async function finalizeBooking(phone, name, age, dateStr, slot, token, opts = {}
 
   const notifyNumber = opts.staffNumber || DOCTOR_NUMBER;
   if (notifyNumber) {
+    const casePaperLink = buildCasePaperLink({ phone, date: dateStr, token });
     await whatsapp.sendText(
       notifyNumber,
-      `Naveen Booking: ${name} (${age}) - Token #${token} - ${dateStr} ${slot} - ${visitType} (Payment: ${opts.paymentStatus || 'Paid'})`
+      `Naveen Booking: ${name} (${age}) - Token #${token} - ${dateStr} ${slot} - ${visitType} (Payment: ${opts.paymentStatus || 'Paid'})\nKaran: ${reason || '-'}\n\n📋 Case Paper: ${casePaperLink}`
     );
   }
 }
@@ -146,7 +168,7 @@ async function handleStaffConfirm(lastDigits, staffNum, clinicName) {
     return;
   }
 
-  await finalizeBooking(pending.phone, pending.name, pending.age, pending.date, pending.slot, token, {
+  await finalizeBooking(pending.phone, pending.name, pending.age, pending.reason, pending.date, pending.slot, token, {
     paymentStatus: 'Paid',
     staffNumber: staffNum,
     lang: pending.lang,
@@ -193,6 +215,151 @@ app.get('/admin/generate-slots', async (req, res) => {
   } catch (err) {
     console.error('generate-slots error:', err.message);
     res.status(500).send('Error: ' + err.message);
+  }
+});
+
+// ---------- 2c. Case paper / prescription page for the doctor ----------
+// Staff/doctor get a link to this page (sent via WhatsApp when a booking is
+// confirmed). It shows the patient's details and a blank prescription table
+// the doctor can fill in (works fine on a phone/tablet touchscreen thanks to
+// contenteditable cells) and print directly from the browser.
+
+function escapeHtml(str) {
+  return String(str || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function buildCasePaperHtml({ clinicName, name, age, reason, date, slot, token, visitType }) {
+  const rxRows = Array.from({ length: 12 })
+    .map(
+      () => `
+      <tr>
+        <td class="num"></td>
+        <td contenteditable="true"></td>
+        <td contenteditable="true" class="center"></td>
+        <td contenteditable="true" class="center"></td>
+        <td contenteditable="true" class="center"></td>
+        <td contenteditable="true" class="center"></td>
+        <td contenteditable="true" class="center"></td>
+      </tr>`
+    )
+    .join('');
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Case Paper - ${escapeHtml(name)}</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: Arial, Helvetica, sans-serif; margin: 0; padding: 20px; color: #1a1a1a; }
+  .header { text-align: center; border-bottom: 3px solid #1a5f3f; padding-bottom: 12px; margin-bottom: 18px; }
+  .header h1 { margin: 0; color: #1a5f3f; font-size: 24px; }
+  .header p { margin: 4px 0 0; color: #555; font-size: 13px; }
+  .patient-info { display: flex; flex-wrap: wrap; gap: 10px 24px; background: #f5f8f6; border: 1px solid #d8e3dd; border-radius: 8px; padding: 14px 18px; margin-bottom: 20px; }
+  .patient-info div { font-size: 14px; }
+  .patient-info span.label { color: #666; display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.03em; }
+  .patient-info span.value { font-weight: bold; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 11px; font-weight: bold; }
+  .badge.new { background: #fde7cf; color: #a15c00; }
+  .badge.followup { background: #d9f0e3; color: #1a5f3f; }
+  h2.rx { font-size: 16px; color: #1a5f3f; margin: 0 0 10px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { border: 1px solid #bbb; padding: 8px 6px; font-size: 13px; }
+  th { background: #1a5f3f; color: #fff; font-size: 12px; text-transform: uppercase; }
+  td.num { text-align: center; color: #999; width: 30px; }
+  td.center { text-align: center; }
+  td[contenteditable="true"] { min-height: 22px; }
+  td[contenteditable="true"]:focus { outline: 2px solid #1a5f3f; background: #fbfffa; }
+  .print-btn { display: block; margin: 20px auto 0; padding: 12px 28px; background: #1a5f3f; color: #fff; border: none; border-radius: 8px; font-size: 15px; cursor: pointer; }
+  .footer-note { margin-top: 24px; font-size: 12px; color: #888; text-align: center; }
+  @media print {
+    .no-print { display: none !important; }
+    body { padding: 0; }
+  }
+</style>
+</head>
+<body>
+
+  <div class="header">
+    <h1>${escapeHtml(clinicName)}</h1>
+    <p>Case Paper / Prescription</p>
+  </div>
+
+  <div class="patient-info">
+    <div><span class="label">Patient Name</span><span class="value">${escapeHtml(name)}</span></div>
+    <div><span class="label">Age</span><span class="value">${escapeHtml(age)}</span></div>
+    <div><span class="label">Token No.</span><span class="value">${escapeHtml(token)}</span></div>
+    <div><span class="label">Date</span><span class="value">${escapeHtml(date)}</span></div>
+    <div><span class="label">Time</span><span class="value">${escapeHtml(slot)}</span></div>
+    <div><span class="label">Visit Type</span>
+      <span class="badge ${visitType === 'New' ? 'new' : 'followup'}">${escapeHtml(visitType)}</span>
+    </div>
+    <div style="flex-basis:100%;"><span class="label">Reason for Visit</span><span class="value">${escapeHtml(reason) || '-'}</span></div>
+  </div>
+
+  <h2 class="rx">℞ Prescription</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Medicine Name</th>
+        <th>Morning</th>
+        <th>Evening</th>
+        <th>Before Meal</th>
+        <th>After Meal</th>
+        <th>Days</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${rxRows}
+    </tbody>
+  </table>
+
+  <button class="print-btn no-print" onclick="window.print()">🖨️ Print Case Paper</button>
+  <p class="footer-note">Tap any cell above to type before printing. This page is not saved automatically.</p>
+
+</body>
+</html>`;
+}
+
+// Example: https://your-app.onrender.com/case-paper?secret=YOUR_SECRET&phone=91xxxxxxxxxx&date=2026-09-05&token=3
+app.get('/case-paper', async (req, res) => {
+  if (req.query.secret !== TRIGGER_SECRET) {
+    return res.sendStatus(401);
+  }
+  const { phone, date, token } = req.query;
+  if (!phone || !date || !token) {
+    return res.status(400).send('phone, date and token query params are required.');
+  }
+
+  try {
+    const settings = await sheets.getSettings();
+    const booking = await sheets.findBooking({ phone: String(phone), date: String(date), token: String(token) });
+    if (!booking) {
+      return res.status(404).send('No matching booking found. Double-check the phone, date and token in the link.');
+    }
+
+    const html = buildCasePaperHtml({
+      clinicName: settings.clinicName || CLINIC_NAME_FALLBACK,
+      name: booking.Name,
+      age: booking.Age,
+      reason: booking.Reason,
+      date: booking.Date,
+      slot: booking.Slot,
+      token: booking['Token Number'],
+      visitType: booking['Visit Type'],
+    });
+
+    res.set('Content-Type', 'text/html');
+    res.send(html);
+  } catch (err) {
+    console.error('case-paper error:', err.message);
+    res.status(500).send('Error loading case paper: ' + err.message);
   }
 });
 
@@ -278,6 +445,7 @@ app.post('/webhook', async (req, res) => {
         step: 'ASK_AGE',
         name: text.trim(),
         age: '',
+        reason: '',
         date: '',
         slot: '',
         lang: state.lang,
@@ -293,9 +461,28 @@ app.post('/webhook', async (req, res) => {
         return;
       }
       await sheets.setPendingState(from, {
-        step: 'ASK_DATE',
+        step: 'ASK_REASON',
         name: state.name,
         age: String(age),
+        reason: '',
+        date: '',
+        slot: '',
+        lang: state.lang,
+      });
+      await whatsapp.sendText(from, M.askReason);
+      return;
+    }
+
+    if (state.step === 'ASK_REASON') {
+      if (!text || text.trim().length < 2) {
+        await whatsapp.sendText(from, M.invalidReason);
+        return;
+      }
+      await sheets.setPendingState(from, {
+        step: 'ASK_DATE',
+        name: state.name,
+        age: state.age,
+        reason: text.trim(),
         date: '',
         slot: '',
         lang: state.lang,
@@ -359,7 +546,7 @@ app.post('/webhook', async (req, res) => {
           await whatsapp.forwardImageWithButtons(
             staffNumber,
             imageId,
-            `📥 *Payment Screenshot*\n\n👤 ${state.name} (${state.age})\n📅 ${state.date}  🕒 ${state.slot}\n📱 ...${last4}`,
+            `📥 *Payment Screenshot*\n\n👤 ${state.name} (${state.age})\n🩺 ${state.reason || '-'}\n📅 ${state.date}  🕒 ${state.slot}\n📱 ...${last4}`,
             [
               { id: `confirm_${last4}`, title: '✅ Confirm' },
               { id: `hold_${last4}`, title: '⏳ Hold' },
