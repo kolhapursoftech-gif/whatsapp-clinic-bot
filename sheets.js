@@ -101,9 +101,63 @@ async function getSettings() {
     maxCapacityPerSlot: map['Max Capacity Per Slot'] || '1',
     daysAhead: map['Days To Generate Ahead'] || '7',
     minNoticeMinutes: map['Minimum Notice Minutes'] || '30',
+    defaultLanguage: ['mr', 'hi', 'en'].includes((map['Default Language'] || '').trim().toLowerCase())
+      ? map['Default Language'].trim().toLowerCase()
+      : '',
   };
   settingsCacheAt = now;
   return settingsCache;
+}
+
+// ---------- Patients (remembers returning patients across bookings) ----------
+// Separate from Pending because Pending gets wiped clean after every single
+// booking (step: DONE) — we need something that survives so a patient who
+// booked last month doesn't have to pick a language and retype their name
+// again this month.
+
+async function getPatientProfile(phone) {
+  const { header, rows } = await readTab('Patients');
+  const phoneIdx = header.indexOf('Phone Number');
+  if (phoneIdx === -1) return null;
+  const row = rows.find((r) => stripQuote(r[phoneIdx]) === phone);
+  if (!row) return null;
+
+  const obj = rowToObject(header, row);
+  return {
+    phone: stripQuote(obj['Phone Number']),
+    name: obj.Name,
+    age: obj.Age,
+    lang: obj.Lang,
+    lastVisitDate: stripQuote(obj['Last Visit Date']),
+  };
+}
+
+async function upsertPatientProfile(phone, { name, age, lang, lastVisitDate }) {
+  const sheets = await getSheetsClient();
+  const { header, rows } = await readTab('Patients');
+  const phoneIdx = header.indexOf('Phone Number');
+
+  const newRow = [`'${phone}`, name || '', age || '', lang || '', lastVisitDate ? `'${lastVisitDate}` : ''];
+
+  const existingIndex = phoneIdx === -1 ? -1 : rows.findIndex((r) => stripQuote(r[phoneIdx]) === phone);
+
+  if (existingIndex === -1) {
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SHEET_ID,
+      range: 'Patients!A:E',
+      valueInputOption: 'USER_ENTERED',
+      insertDataOption: 'INSERT_ROWS',
+      requestBody: { values: [newRow] },
+    });
+  } else {
+    const sheetRowNumber = existingIndex + 2;
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SHEET_ID,
+      range: `Patients!A${sheetRowNumber}:E${sheetRowNumber}`,
+      valueInputOption: 'USER_ENTERED',
+      requestBody: { values: [newRow] },
+    });
+  }
 }
 
 // ---------- New vs Follow-up patient detection ----------
@@ -505,6 +559,8 @@ async function findBooking({ phone, date, token }) {
 
 module.exports = {
   getSettings,
+  getPatientProfile,
+  upsertPatientProfile,
   getVisitType,
   getLastVisitDate,
   findBooking,
