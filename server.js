@@ -554,20 +554,22 @@ app.post('/webhook', async (req, res) => {
     }
 
     if (state.step === 'ASK_NAME') {
-      if (!text || text.trim().length < 2) {
+      const cleanedName = (text || '').trim();
+      const isGreetingJunk = /^(hi|hii|hello|hey|test|ok|okay|namaste|namaskar)$/i.test(cleanedName);
+      if (!cleanedName || cleanedName.length < 2 || isGreetingJunk) {
         await whatsapp.sendText(from, M.invalidName);
         return;
       }
       await sheets.setPendingState(from, {
         step: 'ASK_AGE',
-        name: text.trim(),
+        name: cleanedName,
         age: '',
         reason: '',
         date: '',
         slot: '',
         lang: state.lang,
       });
-      await whatsapp.sendText(from, M.askAge(text.trim()));
+      await whatsapp.sendText(from, M.askAge(cleanedName));
       return;
     }
 
