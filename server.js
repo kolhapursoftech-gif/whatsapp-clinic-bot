@@ -232,7 +232,7 @@ function escapeHtml(str) {
     .replace(/"/g, '&quot;');
 }
 
-function buildCasePaperHtml({ clinicName, name, age, reason, date, slot, token, visitType }) {
+function buildCasePaperHtml({ clinicName, clinicAddress, clinicPhone, name, age, reason, date, slot, token, visitType }) {
   const rxRows = Array.from({ length: 12 })
     .map(
       () => `
@@ -248,6 +248,10 @@ function buildCasePaperHtml({ clinicName, name, age, reason, date, slot, token, 
     )
     .join('');
 
+  const contactLine = [clinicAddress, clinicPhone ? `📞 ${clinicPhone}` : '']
+    .filter(Boolean)
+    .join('  •  ');
+
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -256,27 +260,38 @@ function buildCasePaperHtml({ clinicName, name, age, reason, date, slot, token, 
 <title>Case Paper - ${escapeHtml(name)}</title>
 <style>
   * { box-sizing: border-box; }
-  body { font-family: Arial, Helvetica, sans-serif; margin: 0; padding: 20px; color: #1a1a1a; }
-  .header { text-align: center; border-bottom: 3px solid #1a5f3f; padding-bottom: 12px; margin-bottom: 18px; }
-  .header h1 { margin: 0; color: #1a5f3f; font-size: 24px; }
-  .header p { margin: 4px 0 0; color: #555; font-size: 13px; }
-  .patient-info { display: flex; flex-wrap: wrap; gap: 10px 24px; background: #f5f8f6; border: 1px solid #d8e3dd; border-radius: 8px; padding: 14px 18px; margin-bottom: 20px; }
+  body { font-family: Arial, Helvetica, sans-serif; margin: 0; padding: 24px; color: #1a1a1a; background: #fff; }
+  .sheet { max-width: 820px; margin: 0 auto; }
+
+  .header { text-align: center; padding-bottom: 16px; margin-bottom: 20px; border-bottom: 4px solid #1a5f3f; }
+  .header h1 { margin: 0; color: #1a5f3f; font-size: 28px; letter-spacing: 0.02em; }
+  .header .contact { margin: 6px 0 0; color: #555; font-size: 12.5px; }
+  .header .subtitle { margin: 10px 0 0; color: #1a5f3f; font-size: 13px; font-weight: bold; text-transform: uppercase; letter-spacing: 0.08em; }
+
+  .patient-info { display: flex; flex-wrap: wrap; gap: 12px 28px; background: #f5f8f6; border: 1px solid #d8e3dd; border-radius: 10px; padding: 16px 20px; margin-bottom: 22px; }
   .patient-info div { font-size: 14px; }
-  .patient-info span.label { color: #666; display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.03em; }
-  .patient-info span.value { font-weight: bold; }
-  .badge { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 11px; font-weight: bold; }
+  .patient-info span.label { color: #6b7d74; display: block; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 2px; }
+  .patient-info span.value { font-weight: bold; color: #1a1a1a; }
+  .badge { display: inline-block; padding: 3px 12px; border-radius: 12px; font-size: 11px; font-weight: bold; }
   .badge.new { background: #fde7cf; color: #a15c00; }
   .badge.followup { background: #d9f0e3; color: #1a5f3f; }
-  h2.rx { font-size: 16px; color: #1a5f3f; margin: 0 0 10px; }
+
+  h2.rx { font-size: 17px; color: #1a5f3f; margin: 0 0 12px; border-left: 4px solid #1a5f3f; padding-left: 10px; }
   table { width: 100%; border-collapse: collapse; }
-  th, td { border: 1px solid #bbb; padding: 8px 6px; font-size: 13px; }
-  th { background: #1a5f3f; color: #fff; font-size: 12px; text-transform: uppercase; }
+  th, td { border: 1px solid #c3cfc9; padding: 10px 8px; font-size: 13px; }
+  th { background: #1a5f3f; color: #fff; font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.03em; }
   td.num { text-align: center; color: #999; width: 30px; }
   td.center { text-align: center; }
-  td[contenteditable="true"] { min-height: 22px; }
+  td[contenteditable="true"] { min-height: 26px; }
   td[contenteditable="true"]:focus { outline: 2px solid #1a5f3f; background: #fbfffa; }
-  .print-btn { display: block; margin: 20px auto 0; padding: 12px 28px; background: #1a5f3f; color: #fff; border: none; border-radius: 8px; font-size: 15px; cursor: pointer; }
-  .footer-note { margin-top: 24px; font-size: 12px; color: #888; text-align: center; }
+
+  .signature-row { display: flex; justify-content: space-between; align-items: flex-end; margin-top: 56px; padding: 0 6px; }
+  .signature-block { text-align: center; width: 220px; }
+  .signature-line { border-top: 1.5px solid #444; margin-bottom: 6px; height: 34px; }
+  .signature-block .label { font-size: 12px; color: #555; }
+
+  .print-btn { display: block; margin: 30px auto 0; padding: 12px 28px; background: #1a5f3f; color: #fff; border: none; border-radius: 8px; font-size: 15px; cursor: pointer; }
+
   @media print {
     .no-print { display: none !important; }
     body { padding: 0; }
@@ -284,10 +299,12 @@ function buildCasePaperHtml({ clinicName, name, age, reason, date, slot, token, 
 </style>
 </head>
 <body>
+<div class="sheet">
 
   <div class="header">
     <h1>${escapeHtml(clinicName)}</h1>
-    <p>Case Paper / Prescription</p>
+    ${contactLine ? `<p class="contact">${escapeHtml(contactLine)}</p>` : ''}
+    <p class="subtitle">Case Paper &amp; Prescription</p>
   </div>
 
   <div class="patient-info">
@@ -320,9 +337,20 @@ function buildCasePaperHtml({ clinicName, name, age, reason, date, slot, token, 
     </tbody>
   </table>
 
-  <button class="print-btn no-print" onclick="window.print()">🖨️ Print Case Paper</button>
-  <p class="footer-note">Tap any cell above to type before printing. This page is not saved automatically.</p>
+  <div class="signature-row">
+    <div class="signature-block">
+      <div class="signature-line"></div>
+      <div class="label">Date</div>
+    </div>
+    <div class="signature-block">
+      <div class="signature-line"></div>
+      <div class="label">Doctor's Signature</div>
+    </div>
+  </div>
 
+  <button class="print-btn no-print" onclick="window.print()">🖨️ Print Case Paper</button>
+
+</div>
 </body>
 </html>`;
 }
@@ -346,6 +374,8 @@ app.get('/case-paper', async (req, res) => {
 
     const html = buildCasePaperHtml({
       clinicName: settings.clinicName || CLINIC_NAME_FALLBACK,
+      clinicAddress: settings.clinicAddress,
+      clinicPhone: settings.clinicPhone,
       name: booking.Name,
       age: booking.Age,
       reason: booking.Reason,
