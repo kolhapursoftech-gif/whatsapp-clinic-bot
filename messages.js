@@ -16,16 +16,23 @@ const LANGUAGE_BUTTONS = [
   { id: 'lang_en', title: '💬 English' },
 ];
 
-// Shown before we know which language the patient wants, so it's written
-// once in all three so everyone understands it regardless of preference.
-const LANGUAGE_PROMPT =
-  '👋 Namaskar / नमस्ते / Hello!\nKripaya bhasha nivda / Kripya bhasha chunein / Please choose your language:';
+// Shown to brand-new patients (in English) before we know their language
+// preference yet.
+const languagePrompt = (clinicName) =>
+  `👋 *Welcome to ${clinicName}!* 🏥\n\nPlease choose your language to continue:`;
+
+const SAME_PATIENT_BUTTONS = [
+  { id: 'same_patient', title: '✅ Yes, same person' },
+  { id: 'different_patient', title: '👤 Someone else' },
+];
 
 const TEMPLATES = {
   mr: {
     invalidName: '❗ Kripaya barobar naav sanga (kimman 2 akshar).',
     welcomeAskName: (clinic) =>
       `👋 *Namaskar!*\n*${clinic}* madhe swagat aahe.\n\nAppointment book karayla, kripaya tumche *purna naav* sanga.`,
+    welcomeBack: (clinic, name) => `👋 *Punha swagat, ${name}!*\n*${clinic}* madhe tumche swagat aahe.`,
+    askSamePatient: (name) => `Hi appointment *${name}* sathich aahe, ki doosarya konasathi?`,
     askAge: (name) => `Dhanyawad, *${name}*! 🙏\nAata tumche *vay (age)* sanga.`,
     invalidAge: '❗ Kripaya barobar vay (number madhe) sanga.',
     askReason: '🩺 Kashasathi appointment havi aahe? Thodkyat sanga (udah. taap, dukhne, checkup).',
@@ -56,6 +63,8 @@ const TEMPLATES = {
     invalidName: '❗ Kripya sahi naam bataiye (kam se kam 2 akshar).',
     welcomeAskName: (clinic) =>
       `👋 *Namaste!*\n*${clinic}* mein aapka swagat hai.\n\nAppointment book karne ke liye, kripya apna *poora naam* bataiye.`,
+    welcomeBack: (clinic, name) => `👋 *Phir se swagat hai, ${name}!*\n*${clinic}* mein aapka swagat hai.`,
+    askSamePatient: (name) => `Kya yeh appointment *${name}* ke liye hai, ya kisi aur ke liye?`,
     askAge: (name) => `Dhanyawad, *${name}*! 🙏\nAb apni *umar (age)* bataiye.`,
     invalidAge: '❗ Kripya sahi umar (number mein) bataiye.',
     askReason: '🩺 Appointment kis liye chahiye? Sankshep mein bataiye (jaise, bukhar, dard, checkup).',
@@ -86,6 +95,8 @@ const TEMPLATES = {
     invalidName: '❗ Please enter a valid name (at least 2 letters).',
     welcomeAskName: (clinic) =>
       `👋 *Hello!*\nWelcome to *${clinic}*.\n\nTo book an appointment, please tell us your *full name*.`,
+    welcomeBack: (clinic, name) => `👋 *Welcome back, ${name}!*\nGreat to see you again at *${clinic}*.`,
+    askSamePatient: (name) => `Is this appointment for *${name}*, or someone else?`,
     askAge: (name) => `Thank you, *${name}*! 🙏\nNow please tell us your *age*.`,
     invalidAge: '❗ Please enter a valid age (a number).',
     askReason: '🩺 What is the appointment for? Please briefly describe (e.g. fever, pain, checkup).',
@@ -117,4 +128,4 @@ function getMessages(lang) {
   return TEMPLATES[lang] || TEMPLATES.mr;
 }
 
-module.exports = { getMessages, LANGUAGE_BUTTONS, LANGUAGE_PROMPT };
+module.exports = { getMessages, LANGUAGE_BUTTONS, languagePrompt, SAME_PATIENT_BUTTONS };
