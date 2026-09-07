@@ -116,9 +116,18 @@ async function getSettings() {
 // again this month.
 
 async function getPatientProfile(phone) {
-  const { header, rows } = await readTab('Patients');
+  let header, rows;
+  try {
+    ({ header, rows } = await readTab('Patients'));
+  } catch (err) {
+    console.error('getPatientProfile: could not read "Patients" tab — check the tab name exactly. Error:', err.message);
+    return null;
+  }
   const phoneIdx = header.indexOf('Phone Number');
-  if (phoneIdx === -1) return null;
+  if (phoneIdx === -1) {
+    console.warn('getPatientProfile: "Phone Number" header not found in Patients tab. Header was:', JSON.stringify(header));
+    return null;
+  }
   const row = rows.find((r) => stripQuote(r[phoneIdx]) === phone);
   if (!row) return null;
 
