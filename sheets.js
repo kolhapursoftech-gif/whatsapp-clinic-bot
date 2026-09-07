@@ -91,6 +91,8 @@ async function getSettings() {
     upiId: map['UPI ID'] || '',
     staffNumber: (map['Staff WhatsApp Number'] || '').replace(/\D/g, ''),
     clinicName: map['Clinic Name'] || 'the clinic',
+    clinicAddress: map['Clinic Address'] || '',
+    clinicPhone: map['Clinic Phone'] || '',
     morningStart: map['Morning Start'] || '',
     morningEnd: map['Morning End'] || '',
     eveningStart: map['Evening Start'] || '',
