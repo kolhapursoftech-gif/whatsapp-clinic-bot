@@ -69,6 +69,7 @@ async function startConversation(phone) {
   const forcedLang = settings.defaultLanguage; // '' if not set in Settings
 
   const profile = await sheets.getPatientProfile(phone);
+  console.log(`startConversation: phone=${phone} forcedLang="${forcedLang}" profile=${JSON.stringify(profile)}`);
   const lang = forcedLang || (profile && profile.lang) || '';
 
   if (profile && profile.name) {
