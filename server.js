@@ -4,7 +4,7 @@ require('dotenv').config();
 const express = require('express');
 const whatsapp = require('./whatsapp');
 const sheets = require('./sheets');
-const { getMessages, LANGUAGE_BUTTONS, LANGUAGE_PROMPT } = require('./messages');
+const { getMessages, LANGUAGE_BUTTONS, languagePrompt, SAME_PATIENT_BUTTONS } = require('./messages');
 
 const app = express();
 app.use(express.json());
@@ -56,7 +56,57 @@ app.get('/webhook', (req, res) => {
 
 // ---------- helpers shared by the missed-call trigger and the webhook handler ----------
 
+// Decides how to greet an incoming patient:
+// 1. If Settings has a "Default Language" forced, skip language selection
+//    entirely and go straight to name (or the same-patient check below).
+// 2. Else if we recognize this phone number (Patients tab), reuse their
+//    saved language and ask "is this for you, or someone else?" instead of
+//    re-collecting name/age.
+// 3. Else (genuinely new number) show the branded English language picker.
 async function startConversation(phone) {
+  const settings = await sheets.getSettings();
+  const clinicName = settings.clinicName || CLINIC_NAME_FALLBACK;
+  const forcedLang = settings.defaultLanguage; // '' if not set in Settings
+
+  const profile = await sheets.getPatientProfile(phone);
+  const lang = forcedLang || (profile && profile.lang) || '';
+
+  if (profile && profile.name) {
+    // Returning patient — skip language picker AND skip re-asking name/age
+    // if it turns out to be the same person.
+    const M = getMessages(lang || 'en');
+    await sheets.setPendingState(phone, {
+      step: 'ASK_SAME_PATIENT',
+      name: profile.name,
+      age: profile.age,
+      reason: '',
+      date: '',
+      slot: '',
+      lang: lang || 'en',
+    });
+    await whatsapp.sendText(phone, M.welcomeBack(clinicName, profile.name));
+    await whatsapp.sendButtons(phone, M.askSamePatient(profile.name), SAME_PATIENT_BUTTONS);
+    return;
+  }
+
+  if (forcedLang) {
+    // Brand-new number, but the clinic has hardcoded a single language —
+    // skip the picker and go straight into the normal name/age flow.
+    const M = getMessages(forcedLang);
+    await sheets.setPendingState(phone, {
+      step: 'ASK_NAME',
+      name: '',
+      age: '',
+      reason: '',
+      date: '',
+      slot: '',
+      lang: forcedLang,
+    });
+    await whatsapp.sendText(phone, M.welcomeAskName(clinicName));
+    return;
+  }
+
+  // Brand-new number, no forced language — show the branded picker.
   await sheets.setPendingState(phone, {
     step: 'ASK_LANGUAGE',
     name: '',
@@ -66,7 +116,7 @@ async function startConversation(phone) {
     slot: '',
     lang: '',
   });
-  await whatsapp.sendButtons(phone, LANGUAGE_PROMPT, LANGUAGE_BUTTONS);
+  await whatsapp.sendButtons(phone, languagePrompt(clinicName), LANGUAGE_BUTTONS);
 }
 
 // Sends the slot list for a date if any slots are free, storing that date on
@@ -132,6 +182,7 @@ async function finalizeBooking(phone, name, age, reason, dateStr, slot, token, o
     paymentStatus: opts.paymentStatus || 'Paid',
     visitType,
   });
+  await sheets.upsertPatientProfile(phone, { name, age, lang: opts.lang, lastVisitDate: dateStr });
   await sheets.clearPendingState(phone);
 
   const M = getMessages(opts.lang);
@@ -454,17 +505,52 @@ app.post('/webhook', async (req, res) => {
     if (state.step === 'ASK_LANGUAGE') {
       const lang = LANG_MAP[buttonId];
       if (!lang) {
-        await whatsapp.sendButtons(from, LANGUAGE_PROMPT, LANGUAGE_BUTTONS);
+        await whatsapp.sendButtons(from, languagePrompt(clinicName), LANGUAGE_BUTTONS);
         return;
       }
       const M = getMessages(lang);
-      await sheets.setPendingState(from, { step: 'ASK_NAME', name: '', age: '', date: '', slot: '', lang });
+      await sheets.setPendingState(from, { step: 'ASK_NAME', name: '', age: '', reason: '', date: '', slot: '', lang });
       await whatsapp.sendText(from, M.welcomeAskName(clinicName));
       return;
     }
 
     // From here on every step has a language already chosen.
     const M = getMessages(state.lang);
+
+    if (state.step === 'ASK_SAME_PATIENT') {
+      if (buttonId === 'same_patient') {
+        // Skip straight to the reason — name/age are already known.
+        await sheets.setPendingState(from, {
+          step: 'ASK_REASON',
+          name: state.name,
+          age: state.age,
+          reason: '',
+          date: '',
+          slot: '',
+          lang: state.lang,
+        });
+        await whatsapp.sendText(from, M.askReason);
+        return;
+      }
+      if (buttonId === 'different_patient') {
+        // Someone else is using this WhatsApp number — collect a fresh
+        // name/age, but keep the already-known language.
+        await sheets.setPendingState(from, {
+          step: 'ASK_NAME',
+          name: '',
+          age: '',
+          reason: '',
+          date: '',
+          slot: '',
+          lang: state.lang,
+        });
+        await whatsapp.sendText(from, M.welcomeAskName(clinicName));
+        return;
+      }
+      // Didn't tap a button — re-ask.
+      await whatsapp.sendButtons(from, M.askSamePatient(state.name), SAME_PATIENT_BUTTONS);
+      return;
+    }
 
     if (state.step === 'ASK_NAME') {
       if (!text || text.trim().length < 2) {
