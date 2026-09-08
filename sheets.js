@@ -539,6 +539,32 @@ async function findPendingByLastDigits(lastDigits, expectedStep) {
   };
 }
 
+// Returns every booking on a given date — used by the staff/doctor
+// dashboard page so they can browse and open any patient's case paper from
+// a PC, any time, not just from the one-off WhatsApp link.
+async function getBookingsForDate(dateStr) {
+  const { header, rows } = await readTab('Bookings');
+  const dateIdx = header.indexOf('Date');
+  if (dateIdx === -1) return [];
+  const matched = rows.filter((r) => stripQuote(r[dateIdx]).trim() === dateStr.trim());
+  return matched.map((r) => rowToObject(header, r));
+}
+
+// Plain list of medicine names from the "Medicines" tab (one name per row,
+// under a "Medicine Name" header) — used to power the autocomplete/search
+// box in the case-paper prescription table.
+async function getMedicineList() {
+  try {
+    const { header, rows } = await readTab('Medicines');
+    const nameIdx = header.indexOf('Medicine Name');
+    const idx = nameIdx === -1 ? 0 : nameIdx; // fall back to column A if header is missing
+    return rows.map((r) => (r[idx] || '').trim()).filter(Boolean);
+  } catch (err) {
+    console.error('getMedicineList: could not read "Medicines" tab. Error:', err.message);
+    return [];
+  }
+}
+
 // Looks up a single confirmed booking for the case-paper page — matched by
 // phone + date + token (all three together, since a patient could in theory
 // book more than once on the same day).
@@ -572,6 +598,8 @@ module.exports = {
   upsertPatientProfile,
   getVisitType,
   getLastVisitDate,
+  getBookingsForDate,
+  getMedicineList,
   findBooking,
   getAvailableSlots,
   getNextAvailableTokenForSlot,
