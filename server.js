@@ -324,13 +324,25 @@ function escapeHtml(str) {
     .replace(/"/g, '&quot;');
 }
 
-function buildCasePaperHtml({ clinicName, clinicAddress, clinicPhone, name, age, reason, date, slot, token, visitType }) {
+function buildCasePaperHtml({
+  clinicName,
+  clinicAddress,
+  clinicPhone,
+  name,
+  age,
+  reason,
+  date,
+  slot,
+  token,
+  visitType,
+  medicines = [],
+}) {
   const rxRows = Array.from({ length: 12 })
     .map(
       () => `
       <tr>
         <td class="num"></td>
-        <td contenteditable="true"></td>
+        <td><input type="text" class="med-input" list="medlist" placeholder="Type to search medicine..." autocomplete="off"></td>
         <td contenteditable="true" class="center"></td>
         <td contenteditable="true" class="center"></td>
         <td contenteditable="true" class="center"></td>
@@ -339,6 +351,8 @@ function buildCasePaperHtml({ clinicName, clinicAddress, clinicPhone, name, age,
       </tr>`
     )
     .join('');
+
+  const medicineOptions = medicines.map((m) => `<option value="${escapeHtml(m)}">`).join('');
 
   const contactLine = [clinicAddress, clinicPhone ? `📞 ${clinicPhone}` : '']
     .filter(Boolean)
@@ -376,6 +390,8 @@ function buildCasePaperHtml({ clinicName, clinicAddress, clinicPhone, name, age,
   td.center { text-align: center; }
   td[contenteditable="true"] { min-height: 26px; }
   td[contenteditable="true"]:focus { outline: 2px solid #1a5f3f; background: #fbfffa; }
+  .med-input { width: 100%; border: none; font-size: 13px; padding: 6px 4px; font-family: inherit; background: transparent; }
+  .med-input:focus { outline: 2px solid #1a5f3f; background: #fbfffa; }
 
   .signature-row { display: flex; justify-content: space-between; align-items: flex-end; margin-top: 56px; padding: 0 6px; }
   .signature-block { text-align: center; width: 220px; }
@@ -410,6 +426,8 @@ function buildCasePaperHtml({ clinicName, clinicAddress, clinicPhone, name, age,
     </div>
     <div style="flex-basis:100%;"><span class="label">Reason for Visit</span><span class="value">${escapeHtml(reason) || '-'}</span></div>
   </div>
+
+  <datalist id="medlist">${medicineOptions}</datalist>
 
   <h2 class="rx">℞ Prescription</h2>
   <table>
@@ -463,6 +481,7 @@ app.get('/case-paper', async (req, res) => {
     if (!booking) {
       return res.status(404).send('No matching booking found. Double-check the phone, date and token in the link.');
     }
+    const medicines = await sheets.getMedicineList();
 
     const html = buildCasePaperHtml({
       clinicName: settings.clinicName || CLINIC_NAME_FALLBACK,
@@ -475,6 +494,7 @@ app.get('/case-paper', async (req, res) => {
       slot: booking.Slot,
       token: booking['Token Number'],
       visitType: booking['Visit Type'],
+      medicines,
     });
 
     res.set('Content-Type', 'text/html');
@@ -482,6 +502,126 @@ app.get('/case-paper', async (req, res) => {
   } catch (err) {
     console.error('case-paper error:', err.message);
     res.status(500).send('Error loading case paper: ' + err.message);
+  }
+});
+
+// ---------- 2d. Staff/doctor dashboard — browse any day's patients from a PC ----------
+// Unlike the one-off case-paper link sent via WhatsApp at booking time, this
+// page can be opened anytime (bookmark it) and lets staff pick a date and
+// jump straight into any patient's case paper.
+
+function buildDashboardHtml({ clinicName, dateStr, bookings, secret }) {
+  const rowsHtml = bookings.length
+    ? bookings
+        .map((b) => {
+          const phone = String(b['Phone Number'] || '').replace(/^'/, '');
+          const bookingDate = String(b['Date'] || '').replace(/^'/, '');
+          const slot = String(b['Slot'] || '').replace(/^'/, '');
+          const tokenVal = b['Token Number'];
+          const link = `/case-paper?${new URLSearchParams({
+            secret,
+            phone,
+            date: bookingDate,
+            token: String(tokenVal),
+          }).toString()}`;
+          const visitType = b['Visit Type'] || '';
+          return `
+          <tr>
+            <td class="center">${escapeHtml(tokenVal)}</td>
+            <td>${escapeHtml(b.Name)}</td>
+            <td class="center">${escapeHtml(b.Age)}</td>
+            <td class="center">${escapeHtml(slot)}</td>
+            <td>${escapeHtml(b.Reason) || '-'}</td>
+            <td class="center"><span class="badge ${visitType === 'New' ? 'new' : 'followup'}">${escapeHtml(visitType)}</span></td>
+            <td class="center">${escapeHtml(b['Payment Status'])}</td>
+            <td class="center"><a class="open-btn" href="${link}" target="_blank">📋 Open</a></td>
+          </tr>`;
+        })
+        .join('')
+    : `<tr><td colspan="8" class="empty">No bookings for this date yet.</td></tr>`;
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dashboard - ${escapeHtml(clinicName)}</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: Arial, Helvetica, sans-serif; margin: 0; padding: 24px; color: #1a1a1a; background: #f7f9f8; }
+  .sheet { max-width: 1000px; margin: 0 auto; }
+  h1 { color: #1a5f3f; font-size: 22px; margin: 0 0 4px; }
+  .sub { color: #666; font-size: 13px; margin: 0 0 20px; }
+  form.datebar { display: flex; gap: 10px; align-items: center; margin-bottom: 18px; background: #fff; padding: 12px 16px; border-radius: 10px; border: 1px solid #d8e3dd; }
+  form.datebar input[type="date"] { padding: 6px 8px; border: 1px solid #bbb; border-radius: 6px; font-size: 14px; }
+  form.datebar button { padding: 7px 16px; background: #1a5f3f; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; }
+  table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 10px; overflow: hidden; }
+  th, td { border-bottom: 1px solid #e5e9e7; padding: 10px 8px; font-size: 13.5px; text-align: left; }
+  th { background: #1a5f3f; color: #fff; font-size: 11.5px; text-transform: uppercase; }
+  td.center, th.center { text-align: center; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 10.5px; font-weight: bold; }
+  .badge.new { background: #fde7cf; color: #a15c00; }
+  .badge.followup { background: #d9f0e3; color: #1a5f3f; }
+  .open-btn { display: inline-block; padding: 5px 12px; background: #1a5f3f; color: #fff !important; border-radius: 6px; text-decoration: none; font-size: 12.5px; }
+  .empty { text-align: center; color: #999; padding: 24px; }
+</style>
+</head>
+<body>
+<div class="sheet">
+  <h1>${escapeHtml(clinicName)} — Patient Dashboard</h1>
+  <p class="sub">Bookings for the selected date. Bookmark this page for quick access anytime.</p>
+
+  <form class="datebar" method="get">
+    <input type="hidden" name="secret" value="${escapeHtml(secret)}">
+    <label>Date: <input type="date" name="date" value="${escapeHtml(dateStr)}"></label>
+    <button type="submit">Load</button>
+  </form>
+
+  <table>
+    <thead>
+      <tr>
+        <th class="center">Token</th>
+        <th>Name</th>
+        <th class="center">Age</th>
+        <th class="center">Time</th>
+        <th>Reason</th>
+        <th class="center">Visit Type</th>
+        <th class="center">Payment</th>
+        <th class="center">Case Paper</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${rowsHtml}
+    </tbody>
+  </table>
+</div>
+</body>
+</html>`;
+}
+
+// Example: https://your-app.onrender.com/dashboard?secret=YOUR_SECRET
+// Optional &date=YYYY-MM-DD (defaults to today).
+app.get('/dashboard', async (req, res) => {
+  if (req.query.secret !== TRIGGER_SECRET) {
+    return res.sendStatus(401);
+  }
+  try {
+    const settings = await sheets.getSettings();
+    const dateStr = req.query.date || istDateString(0);
+    const bookings = await sheets.getBookingsForDate(dateStr);
+
+    const html = buildDashboardHtml({
+      clinicName: settings.clinicName || CLINIC_NAME_FALLBACK,
+      dateStr,
+      bookings,
+      secret: TRIGGER_SECRET,
+    });
+
+    res.set('Content-Type', 'text/html');
+    res.send(html);
+  } catch (err) {
+    console.error('dashboard error:', err.message);
+    res.status(500).send('Error loading dashboard: ' + err.message);
   }
 });
 
