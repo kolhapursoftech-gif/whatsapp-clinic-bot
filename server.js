@@ -342,17 +342,23 @@ function buildCasePaperHtml({
       () => `
       <tr>
         <td class="num"></td>
-        <td><input type="text" class="med-input" list="medlist" placeholder="Type to search medicine..." autocomplete="off"></td>
-        <td contenteditable="true" class="center"></td>
-        <td contenteditable="true" class="center"></td>
-        <td contenteditable="true" class="center"></td>
-        <td contenteditable="true" class="center"></td>
-        <td contenteditable="true" class="center"></td>
+        <td><input type="text" class="med-input" list="medlist" oninput="handleMedInput(this)" autocomplete="off" placeholder="Type to search medicine..."></td>
+        <td contenteditable="true" class="center cell-morning"></td>
+        <td contenteditable="true" class="center cell-evening"></td>
+        <td contenteditable="true" class="center cell-before"></td>
+        <td contenteditable="true" class="center cell-after"></td>
+        <td contenteditable="true" class="center cell-days"></td>
       </tr>`
     )
     .join('');
 
-  const medicineOptions = medicines.map((m) => `<option value="${escapeHtml(m)}">`).join('');
+  const medicineOptions = medicines.map((m) => `<option value="${escapeHtml(m.name)}">`).join('');
+  const medicineDbJson = JSON.stringify(
+    medicines.reduce((acc, m) => {
+      acc[m.name] = { morning: m.morning, evening: m.evening, beforeMeal: m.beforeMeal, afterMeal: m.afterMeal };
+      return acc;
+    }, {})
+  );
 
   const contactLine = [clinicAddress, clinicPhone ? `📞 ${clinicPhone}` : '']
     .filter(Boolean)
@@ -428,6 +434,22 @@ function buildCasePaperHtml({
   </div>
 
   <datalist id="medlist">${medicineOptions}</datalist>
+  <script>
+    const MEDICINE_DB = ${medicineDbJson};
+    function tickIfSet(value) {
+      return value && String(value).trim() ? '✓' : '';
+    }
+    function handleMedInput(input) {
+      const med = MEDICINE_DB[input.value];
+      if (!med) return; // not an exact match yet — wait for a real selection
+      const row = input.closest('tr');
+      row.querySelector('.cell-morning').textContent = tickIfSet(med.morning);
+      row.querySelector('.cell-evening').textContent = tickIfSet(med.evening);
+      row.querySelector('.cell-before').textContent = tickIfSet(med.beforeMeal);
+      row.querySelector('.cell-after').textContent = tickIfSet(med.afterMeal);
+      // "Days" is left untouched — doctor fills that in manually per patient.
+    }
+  </script>
 
   <h2 class="rx">℞ Prescription</h2>
   <table>
@@ -481,7 +503,7 @@ app.get('/case-paper', async (req, res) => {
     if (!booking) {
       return res.status(404).send('No matching booking found. Double-check the phone, date and token in the link.');
     }
-    const medicines = await sheets.getMedicineList();
+    const medicines = await sheets.getMedicineDatabase();
 
     const html = buildCasePaperHtml({
       clinicName: settings.clinicName || CLINIC_NAME_FALLBACK,
