@@ -93,6 +93,7 @@ async function getSettings() {
     clinicName: map['Clinic Name'] || 'the clinic',
     clinicAddress: map['Clinic Address'] || '',
     clinicPhone: map['Clinic Phone'] || '',
+    doctorName: map['Doctor Name'] || '',
     morningStart: map['Morning Start'] || '',
     morningEnd: map['Morning End'] || '',
     eveningStart: map['Evening Start'] || '',
@@ -580,27 +581,22 @@ async function getBookingsForDate(dateStr) {
 }
 
 // Medicine database with default dosage pattern per medicine, from the
-// "Medicines" tab: Medicine Name | Morning | Evening | Before Meal | After Meal
+// "Medicines" tab. Read by COLUMN POSITION (A, B, C, D, E) rather than
+// matching header text exactly — the header row's wording doesn't matter,
+// only the order: Medicine Name | Morning | Evening | Before Meal | After Meal.
 // Used to power the autocomplete + auto-fill in the case-paper prescription
 // table — doctor picks a medicine, the dosage pattern fills itself in, and
 // only "Days" is left for manual entry (since duration varies per patient).
 async function getMedicineDatabase() {
   try {
-    const { header, rows } = await readTab('Medicines');
-    const nameIdx = header.indexOf('Medicine Name');
-    const morningIdx = header.indexOf('Morning');
-    const eveningIdx = header.indexOf('Evening');
-    const beforeIdx = header.indexOf('Before Meal');
-    const afterIdx = header.indexOf('After Meal');
-    if (nameIdx === -1) return [];
-
+    const { rows } = await readTab('Medicines');
     return rows
       .map((r) => ({
-        name: (r[nameIdx] || '').trim(),
-        morning: morningIdx === -1 ? '' : (r[morningIdx] || '').trim(),
-        evening: eveningIdx === -1 ? '' : (r[eveningIdx] || '').trim(),
-        beforeMeal: beforeIdx === -1 ? '' : (r[beforeIdx] || '').trim(),
-        afterMeal: afterIdx === -1 ? '' : (r[afterIdx] || '').trim(),
+        name: (r[0] || '').trim(),
+        morning: (r[1] || '').trim(),
+        evening: (r[2] || '').trim(),
+        beforeMeal: (r[3] || '').trim(),
+        afterMeal: (r[4] || '').trim(),
       }))
       .filter((m) => m.name);
   } catch (err) {
