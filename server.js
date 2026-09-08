@@ -328,6 +328,7 @@ function buildCasePaperHtml({
   clinicName,
   clinicAddress,
   clinicPhone,
+  doctorName,
   name,
   age,
   reason,
@@ -337,20 +338,17 @@ function buildCasePaperHtml({
   visitType,
   medicines = [],
 }) {
-  const rxRows = Array.from({ length: 12 })
-    .map(
-      () => `
+  const rxRowTemplate = () => `
       <tr>
         <td class="num"></td>
-        <td><input type="text" class="med-input" list="medlist" oninput="handleMedInput(this)" autocomplete="off" placeholder="Type to search medicine..."></td>
+        <td><input type="text" class="med-input" list="medlist" oninput="handleMedInput(this)" onchange="handleMedInput(this)" autocomplete="off" placeholder="Type to search medicine..."></td>
         <td contenteditable="true" class="center cell-morning"></td>
         <td contenteditable="true" class="center cell-evening"></td>
         <td contenteditable="true" class="center cell-before"></td>
         <td contenteditable="true" class="center cell-after"></td>
         <td contenteditable="true" class="center cell-days"></td>
-      </tr>`
-    )
-    .join('');
+      </tr>`;
+  const rxRows = Array.from({ length: 4 }).map(rxRowTemplate).join('');
 
   const medicineOptions = medicines.map((m) => `<option value="${escapeHtml(m.name)}">`).join('');
   const medicineDbJson = JSON.stringify(
@@ -405,6 +403,7 @@ function buildCasePaperHtml({
   .signature-block .label { font-size: 12px; color: #555; }
 
   .print-btn { display: block; margin: 30px auto 0; padding: 12px 28px; background: #1a5f3f; color: #fff; border: none; border-radius: 8px; font-size: 15px; cursor: pointer; }
+  .add-row-btn { display: block; margin: 10px 0 0; padding: 8px 16px; background: #fff; color: #1a5f3f; border: 1.5px dashed #1a5f3f; border-radius: 8px; font-size: 13px; cursor: pointer; }
 
   @media print {
     .no-print { display: none !important; }
@@ -449,6 +448,23 @@ function buildCasePaperHtml({
       row.querySelector('.cell-after').textContent = tickIfSet(med.afterMeal);
       // "Days" is left untouched — doctor fills that in manually per patient.
     }
+
+    let rxRowCount = ${4};
+    function addRxRow() {
+      rxRowCount++;
+      const tbody = document.getElementById('rxBody');
+      const tr = document.createElement('tr');
+      tr.innerHTML = \`
+        <td class="num"></td>
+        <td><input type="text" class="med-input" list="medlist" oninput="handleMedInput(this)" onchange="handleMedInput(this)" autocomplete="off" placeholder="Type to search medicine..."></td>
+        <td contenteditable="true" class="center cell-morning"></td>
+        <td contenteditable="true" class="center cell-evening"></td>
+        <td contenteditable="true" class="center cell-before"></td>
+        <td contenteditable="true" class="center cell-after"></td>
+        <td contenteditable="true" class="center cell-days"></td>
+      \`;
+      tbody.appendChild(tr);
+    }
   </script>
 
   <h2 class="rx">℞ Prescription</h2>
@@ -464,10 +480,12 @@ function buildCasePaperHtml({
         <th>Days</th>
       </tr>
     </thead>
-    <tbody>
+    <tbody id="rxBody">
       ${rxRows}
     </tbody>
   </table>
+
+  <button class="add-row-btn no-print" onclick="addRxRow()">+ Add Medicine Row</button>
 
   <div class="signature-row">
     <div class="signature-block">
@@ -476,7 +494,7 @@ function buildCasePaperHtml({
     </div>
     <div class="signature-block">
       <div class="signature-line"></div>
-      <div class="label">Doctor's Signature</div>
+      <div class="label">${doctorName ? escapeHtml(doctorName) : "Doctor's Signature"}</div>
     </div>
   </div>
 
@@ -509,6 +527,7 @@ app.get('/case-paper', async (req, res) => {
       clinicName: settings.clinicName || CLINIC_NAME_FALLBACK,
       clinicAddress: settings.clinicAddress,
       clinicPhone: settings.clinicPhone,
+      doctorName: settings.doctorName,
       name: booking.Name,
       age: booking.Age,
       reason: booking.Reason,
