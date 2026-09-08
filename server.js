@@ -894,4 +894,18 @@ app.post('/webhook', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`WhatsApp clinic bot listening on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`WhatsApp clinic bot listening on port ${PORT}`);
+
+  // Publish the dashboard link into the Settings tab so the clinic can just
+  // open the Sheet and copy it, instead of building the URL by hand.
+  if (APP_BASE_URL && TRIGGER_SECRET) {
+    const dashboardLink = `${APP_BASE_URL}/dashboard?secret=${TRIGGER_SECRET}`;
+    sheets
+      .setSettingValue('Dashboard Link', dashboardLink)
+      .then(() => console.log('Dashboard Link written to Settings tab:', dashboardLink))
+      .catch((err) => console.error('Could not write Dashboard Link to Settings tab:', err.message));
+  } else {
+    console.warn('APP_BASE_URL or TRIGGER_SECRET not set — skipping Dashboard Link auto-publish.');
+  }
+});
