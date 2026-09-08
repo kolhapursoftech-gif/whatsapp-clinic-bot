@@ -51,6 +51,8 @@ const TEMPLATES = {
     noSlots: '😔 Kshama kara, ya divashi ekahi vel shillak nahi. Kripaya doosra divas nivda.',
     paymentCaption: (fee, upiId, clinic, visitType) =>
       `🧾 *${clinic}*\n${visitType === 'New' ? '🆕 New Patient (naveen case paper)' : '🔁 Follow-up Patient'}\n\n💳 Appointment Fee: *Rs ${fee}*\nUPI ID: *${upiId}*\n\nQR scan karun payment kara, ani payment cha *screenshot* ithech pathva.`,
+    freeAppointmentMessage: (visitType) =>
+      `✅ Tumchi appointment *MOFAT (free)* aahe${visitType === 'Follow-up' ? ' (Follow-up)' : ''}.\nStaff confirm karat aahet, kripaya thoda vel thamba.`,
     screenshotReceived: '✅ Dhanyawad! Tumcha payment screenshot milala.\nStaff verify karat aahet, kripaya thoda vel thamba.',
     askForScreenshot: '📸 Kripaya payment cha screenshot (photo) pathva.',
     stillWaiting: '⏳ Amhi tumcha payment verify karat aahot. Kripaya thoda vel thamba, confirmation lavkarach yeil.',
@@ -83,6 +85,8 @@ const TEMPLATES = {
     noSlots: '😔 Maaf kijiye, is din koi samay khali nahi hai. Kripya doosra din chunein.',
     paymentCaption: (fee, upiId, clinic, visitType) =>
       `🧾 *${clinic}*\n${visitType === 'New' ? '🆕 New Patient (naya case paper)' : '🔁 Follow-up Patient'}\n\n💳 Appointment Fee: *Rs ${fee}*\nUPI ID: *${upiId}*\n\nQR scan karke payment karein, aur payment ka *screenshot* yahin bhejein.`,
+    freeAppointmentMessage: (visitType) =>
+      `✅ Aapki appointment *MUFT (free)* hai${visitType === 'Follow-up' ? ' (Follow-up)' : ''}.\nStaff confirm kar rahe hain, kripya thoda intezaar karein.`,
     screenshotReceived: '✅ Dhanyawad! Aapka payment screenshot mil gaya.\nStaff verify kar rahe hain, kripya thoda intezaar karein.',
     askForScreenshot: '📸 Kripya payment ka screenshot (photo) bhejein.',
     stillWaiting: '⏳ Hum aapka payment verify kar rahe hain. Kripya thoda intezaar karein, confirmation jald aayega.',
@@ -115,6 +119,8 @@ const TEMPLATES = {
     noSlots: '😔 Sorry, no slots are left for this day. Please choose another day.',
     paymentCaption: (fee, upiId, clinic, visitType) =>
       `🧾 *${clinic}*\n${visitType === 'New' ? '🆕 New Patient (new case paper)' : '🔁 Follow-up Patient'}\n\n💳 Appointment Fee: *Rs ${fee}*\nUPI ID: *${upiId}*\n\nScan the QR to pay, and send the payment *screenshot* here.`,
+    freeAppointmentMessage: (visitType) =>
+      `✅ Your appointment is *FREE*${visitType === 'Follow-up' ? ' (Follow-up)' : ''}.\nOur staff is confirming it, please wait a moment.`,
     screenshotReceived: '✅ Thank you! We received your payment screenshot.\nOur staff is verifying it, please wait a moment.',
     askForScreenshot: '📸 Please send a screenshot (photo) of your payment.',
     stillWaiting: "⏳ We're still verifying your payment. Please wait a bit, confirmation will arrive soon.",
