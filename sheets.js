@@ -109,6 +109,35 @@ async function getSettings() {
   return settingsCache;
 }
 
+// Writes (or updates) a single Key/Value row in the Settings tab — used to
+// publish computed values back to the sheet, e.g. the dashboard link, so
+// the clinic doesn't have to build/copy it by hand. Also clears the local
+// cache so the next getSettings() call picks up any change immediately.
+async function setSettingValue(key, value) {
+  const sheets = await getSheetsClient();
+  const { rows } = await readTab('Settings');
+
+  const existingIndex = rows.findIndex((r) => (r[0] || '').trim() === key);
+  if (existingIndex === -1) {
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SHEET_ID,
+      range: 'Settings!A:B',
+      valueInputOption: 'USER_ENTERED',
+      insertDataOption: 'INSERT_ROWS',
+      requestBody: { values: [[key, value]] },
+    });
+  } else {
+    const sheetRowNumber = existingIndex + 2; // +1 header, +1 for 1-indexing
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SHEET_ID,
+      range: `Settings!B${sheetRowNumber}`,
+      valueInputOption: 'USER_ENTERED',
+      requestBody: { values: [[value]] },
+    });
+  }
+  settingsCache = null; // force a fresh read next time
+}
+
 // ---------- Patients (remembers returning patients across bookings) ----------
 // Separate from Pending because Pending gets wiped clean after every single
 // booking (step: DONE) — we need something that survives so a patient who
@@ -609,6 +638,7 @@ async function findBooking({ phone, date, token }) {
 
 module.exports = {
   getSettings,
+  setSettingValue,
   getPatientProfile,
   upsertPatientProfile,
   getVisitType,
