@@ -151,6 +151,41 @@ async function movePatientToPaymentStep(phone, state, settingsObj) {
   const M = getMessages(state.lang);
   const visitType = await sheets.getVisitType(phone);
   const fee = visitType === 'Follow-up' ? settingsObj.followUpFee : settingsObj.newPatientFee;
+  const feeNum = parseInt(fee, 10) || 0;
+
+  // Fee set to 0 in Settings (typically Follow-up Fee) — skip payment
+  // entirely. Staff still has to confirm, but based on the case-paper
+  // validity instead of a payment screenshot.
+  if (feeNum === 0) {
+    await sheets.setPendingState(phone, {
+      step: 'AWAITING_STAFF_CONFIRM',
+      name: state.name,
+      age: state.age,
+      reason: state.reason,
+      date: state.date,
+      slot: state.slot,
+      lang: state.lang,
+    });
+    await whatsapp.sendText(phone, M.freeAppointmentMessage(visitType));
+
+    const staffNumber = settingsObj.staffNumber || (DOCTOR_NUMBER || '').replace(/\D/g, '');
+    if (staffNumber) {
+      const last4 = phone.slice(-4);
+      const lastVisitDate = await sheets.getLastVisitDate(phone);
+      const caseNote = lastVisitDate ? `📋 Last case paper: ${lastVisitDate} (still valid)\n` : '';
+      await whatsapp.sendButtons(
+        staffNumber,
+        `🆓 *Free ${visitType} Booking*\n\n👤 ${state.name} (${state.age})\n🩺 ${state.reason || '-'}\n📅 ${state.date}  🕒 ${state.slot}\n${caseNote}📱 ...${last4}`,
+        [
+          { id: `confirm_${last4}`, title: '✅ Confirm' },
+          { id: `hold_${last4}`, title: '⏳ Hold' },
+        ]
+      );
+    } else {
+      console.warn('No staff number configured — cannot notify staff about free booking.');
+    }
+    return;
+  }
 
   await sheets.setPendingState(phone, {
     step: 'AWAITING_PAYMENT_SCREENSHOT',
@@ -220,8 +255,13 @@ async function handleStaffConfirm(lastDigits, staffNum, clinicName) {
     return;
   }
 
+  const settings = await sheets.getSettings();
+  const visitType = await sheets.getVisitType(pending.phone);
+  const fee = visitType === 'Follow-up' ? settings.followUpFee : settings.newPatientFee;
+  const paymentStatus = (parseInt(fee, 10) || 0) === 0 ? 'Free' : 'Paid';
+
   await finalizeBooking(pending.phone, pending.name, pending.age, pending.reason, pending.date, pending.slot, token, {
-    paymentStatus: 'Paid',
+    paymentStatus,
     staffNumber: staffNum,
     lang: pending.lang,
     clinicName,
