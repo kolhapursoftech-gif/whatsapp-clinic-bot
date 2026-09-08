@@ -550,17 +550,32 @@ async function getBookingsForDate(dateStr) {
   return matched.map((r) => rowToObject(header, r));
 }
 
-// Plain list of medicine names from the "Medicines" tab (one name per row,
-// under a "Medicine Name" header) — used to power the autocomplete/search
-// box in the case-paper prescription table.
-async function getMedicineList() {
+// Medicine database with default dosage pattern per medicine, from the
+// "Medicines" tab: Medicine Name | Morning | Evening | Before Meal | After Meal
+// Used to power the autocomplete + auto-fill in the case-paper prescription
+// table — doctor picks a medicine, the dosage pattern fills itself in, and
+// only "Days" is left for manual entry (since duration varies per patient).
+async function getMedicineDatabase() {
   try {
     const { header, rows } = await readTab('Medicines');
     const nameIdx = header.indexOf('Medicine Name');
-    const idx = nameIdx === -1 ? 0 : nameIdx; // fall back to column A if header is missing
-    return rows.map((r) => (r[idx] || '').trim()).filter(Boolean);
+    const morningIdx = header.indexOf('Morning');
+    const eveningIdx = header.indexOf('Evening');
+    const beforeIdx = header.indexOf('Before Meal');
+    const afterIdx = header.indexOf('After Meal');
+    if (nameIdx === -1) return [];
+
+    return rows
+      .map((r) => ({
+        name: (r[nameIdx] || '').trim(),
+        morning: morningIdx === -1 ? '' : (r[morningIdx] || '').trim(),
+        evening: eveningIdx === -1 ? '' : (r[eveningIdx] || '').trim(),
+        beforeMeal: beforeIdx === -1 ? '' : (r[beforeIdx] || '').trim(),
+        afterMeal: afterIdx === -1 ? '' : (r[afterIdx] || '').trim(),
+      }))
+      .filter((m) => m.name);
   } catch (err) {
-    console.error('getMedicineList: could not read "Medicines" tab. Error:', err.message);
+    console.error('getMedicineDatabase: could not read "Medicines" tab. Error:', err.message);
     return [];
   }
 }
@@ -599,7 +614,7 @@ module.exports = {
   getVisitType,
   getLastVisitDate,
   getBookingsForDate,
-  getMedicineList,
+  getMedicineDatabase,
   findBooking,
   getAvailableSlots,
   getNextAvailableTokenForSlot,
