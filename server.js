@@ -370,44 +370,64 @@ function buildCasePaperHtml({
 <title>Case Paper - ${escapeHtml(name)}</title>
 <style>
   * { box-sizing: border-box; }
-  body { font-family: Arial, Helvetica, sans-serif; margin: 0; padding: 24px; color: #1a1a1a; background: #fff; }
-  .sheet { max-width: 820px; margin: 0 auto; }
+  body {
+    font-family: 'Segoe UI', Arial, Helvetica, sans-serif;
+    margin: 0; padding: 32px 16px; color: #1f2b26;
+    background: #eef2f0;
+  }
+  .sheet {
+    max-width: 840px; margin: 0 auto; background: #fff;
+    border-radius: 14px; box-shadow: 0 4px 24px rgba(15, 60, 45, 0.08);
+    padding: 40px 44px 32px;
+  }
 
-  .header { text-align: center; padding-bottom: 16px; margin-bottom: 20px; border-bottom: 4px solid #1a5f3f; }
-  .header h1 { margin: 0; color: #1a5f3f; font-size: 28px; letter-spacing: 0.02em; }
-  .header .contact { margin: 6px 0 0; color: #555; font-size: 12.5px; }
-  .header .subtitle { margin: 10px 0 0; color: #1a5f3f; font-size: 13px; font-weight: bold; text-transform: uppercase; letter-spacing: 0.08em; }
+  .header { text-align: center; padding-bottom: 20px; margin-bottom: 26px; border-bottom: 3px solid #14532d; position: relative; }
+  .header::after { content: ''; position: absolute; left: 50%; bottom: -3px; transform: translateX(-50%); width: 70px; height: 3px; background: #d4a94f; }
+  .header h1 { margin: 0; color: #14532d; font-size: 27px; font-weight: 700; letter-spacing: 0.01em; }
+  .header .contact { margin: 8px 0 0; color: #6b7d74; font-size: 12.5px; }
+  .header .subtitle { margin: 12px 0 0; color: #b8862f; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.12em; }
 
-  .patient-info { display: flex; flex-wrap: wrap; gap: 12px 28px; background: #f5f8f6; border: 1px solid #d8e3dd; border-radius: 10px; padding: 16px 20px; margin-bottom: 22px; }
-  .patient-info div { font-size: 14px; }
-  .patient-info span.label { color: #6b7d74; display: block; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 2px; }
-  .patient-info span.value { font-weight: bold; color: #1a1a1a; }
-  .badge { display: inline-block; padding: 3px 12px; border-radius: 12px; font-size: 11px; font-weight: bold; }
-  .badge.new { background: #fde7cf; color: #a15c00; }
-  .badge.followup { background: #d9f0e3; color: #1a5f3f; }
+  .patient-info {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px 24px;
+    background: #f7faf8; border: 1px solid #e0e9e4; border-radius: 12px;
+    padding: 20px 24px; margin-bottom: 26px;
+  }
+  .patient-info .full { grid-column: 1 / -1; }
+  .patient-info span.label { color: #7c8f85; display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 3px; font-weight: 600; }
+  .patient-info span.value { font-weight: 600; color: #1f2b26; font-size: 14.5px; }
+  .badge { display: inline-block; padding: 3px 13px; border-radius: 20px; font-size: 11px; font-weight: 700; letter-spacing: 0.02em; }
+  .badge.new { background: #fdecd4; color: #a15c00; }
+  .badge.followup { background: #dcf1e6; color: #14532d; }
 
-  h2.rx { font-size: 17px; color: #1a5f3f; margin: 0 0 12px; border-left: 4px solid #1a5f3f; padding-left: 10px; }
-  table { width: 100%; border-collapse: collapse; }
-  th, td { border: 1px solid #c3cfc9; padding: 10px 8px; font-size: 13px; }
-  th { background: #1a5f3f; color: #fff; font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.03em; }
-  td.num { text-align: center; color: #999; width: 30px; }
+  h2.rx { font-size: 15.5px; color: #14532d; margin: 0 0 14px; text-transform: uppercase; letter-spacing: 0.06em; display: flex; align-items: center; gap: 8px; }
+  h2.rx::before { content: '℞'; font-size: 22px; font-style: normal; }
+  table { width: 100%; border-collapse: separate; border-spacing: 0; border-radius: 10px; overflow: hidden; border: 1px solid #dbe5e0; }
+  th, td { padding: 11px 9px; font-size: 13px; border-bottom: 1px solid #e5ece8; }
+  th { background: #14532d; color: #fff; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; text-align: left; }
+  tbody tr:nth-child(even) { background: #fbfdfc; }
+  tbody tr:last-child td { border-bottom: none; }
+  td.num { text-align: center; color: #a7b5af; width: 28px; font-size: 12px; }
   td.center { text-align: center; }
   td[contenteditable="true"] { min-height: 26px; }
-  td[contenteditable="true"]:focus { outline: 2px solid #1a5f3f; background: #fbfffa; }
-  .med-input { width: 100%; border: none; font-size: 13px; padding: 6px 4px; font-family: inherit; background: transparent; }
-  .med-input:focus { outline: 2px solid #1a5f3f; background: #fbfffa; }
+  td[contenteditable="true"]:focus { outline: 2px solid #14532d; background: #f3faf6; }
+  .med-input { width: 100%; border: none; font-size: 13px; padding: 6px 4px; font-family: inherit; background: transparent; color: #1f2b26; }
+  .med-input:focus { outline: 2px solid #14532d; background: #f3faf6; }
+  .med-input::placeholder { color: #b6c2bc; }
 
-  .signature-row { display: flex; justify-content: space-between; align-items: flex-end; margin-top: 56px; padding: 0 6px; }
+  .signature-row { display: flex; justify-content: space-between; align-items: flex-end; margin-top: 60px; padding: 0 6px; }
   .signature-block { text-align: center; width: 220px; }
-  .signature-line { border-top: 1.5px solid #444; margin-bottom: 6px; height: 34px; }
-  .signature-block .label { font-size: 12px; color: #555; }
+  .signature-line { border-top: 1.5px solid #9aa8a1; margin-bottom: 8px; height: 36px; }
+  .signature-block .label { font-size: 12px; color: #6b7d74; font-weight: 600; }
 
-  .print-btn { display: block; margin: 30px auto 0; padding: 12px 28px; background: #1a5f3f; color: #fff; border: none; border-radius: 8px; font-size: 15px; cursor: pointer; }
-  .add-row-btn { display: block; margin: 10px 0 0; padding: 8px 16px; background: #fff; color: #1a5f3f; border: 1.5px dashed #1a5f3f; border-radius: 8px; font-size: 13px; cursor: pointer; }
+  .print-btn { display: block; margin: 32px auto 0; padding: 13px 32px; background: #14532d; color: #fff; border: none; border-radius: 9px; font-size: 15px; font-weight: 600; cursor: pointer; box-shadow: 0 2px 8px rgba(20,83,45,0.25); }
+  .print-btn:hover { background: #0f3f22; }
+  .add-row-btn { display: block; margin: 12px 0 0; padding: 8px 16px; background: #fff; color: #14532d; border: 1.5px dashed #9aa8a1; border-radius: 8px; font-size: 12.5px; font-weight: 600; cursor: pointer; }
+  .add-row-btn:hover { border-color: #14532d; }
 
   @media print {
     .no-print { display: none !important; }
-    body { padding: 0; }
+    body { padding: 0; background: #fff; }
+    .sheet { box-shadow: none; border-radius: 0; padding: 0; max-width: 100%; }
   }
 </style>
 </head>
@@ -429,7 +449,7 @@ function buildCasePaperHtml({
     <div><span class="label">Visit Type</span>
       <span class="badge ${visitType === 'New' ? 'new' : 'followup'}">${escapeHtml(visitType)}</span>
     </div>
-    <div style="flex-basis:100%;"><span class="label">Reason for Visit</span><span class="value">${escapeHtml(reason) || '-'}</span></div>
+    <div class="full"><span class="label">Reason for Visit</span><span class="value">${escapeHtml(reason) || '-'}</span></div>
   </div>
 
   <datalist id="medlist">${medicineOptions}</datalist>
@@ -467,7 +487,7 @@ function buildCasePaperHtml({
     }
   </script>
 
-  <h2 class="rx">℞ Prescription</h2>
+  <h2 class="rx">Prescription</h2>
   <table>
     <thead>
       <tr>
@@ -552,6 +572,12 @@ app.get('/case-paper', async (req, res) => {
 // jump straight into any patient's case paper.
 
 function buildDashboardHtml({ clinicName, dateStr, bookings, secret }) {
+  const total = bookings.length;
+  const newCount = bookings.filter((b) => b['Visit Type'] === 'New').length;
+  const followUpCount = bookings.filter((b) => b['Visit Type'] === 'Follow-up').length;
+  const paidCount = bookings.filter((b) => b['Payment Status'] === 'Paid').length;
+  const freeCount = bookings.filter((b) => b['Payment Status'] === 'Free').length;
+
   const rowsHtml = bookings.length
     ? bookings
         .map((b) => {
@@ -566,15 +592,16 @@ function buildDashboardHtml({ clinicName, dateStr, bookings, secret }) {
             token: String(tokenVal),
           }).toString()}`;
           const visitType = b['Visit Type'] || '';
+          const paymentStatus = b['Payment Status'] || '';
           return `
-          <tr>
-            <td class="center">${escapeHtml(tokenVal)}</td>
-            <td>${escapeHtml(b.Name)}</td>
+          <tr class="patient-row" data-name="${escapeHtml((b.Name || '').toLowerCase())}">
+            <td class="center token-cell">${escapeHtml(tokenVal)}</td>
+            <td class="name-cell">${escapeHtml(b.Name)}</td>
             <td class="center">${escapeHtml(b.Age)}</td>
             <td class="center">${escapeHtml(slot)}</td>
-            <td>${escapeHtml(b.Reason) || '-'}</td>
+            <td class="reason-cell">${escapeHtml(b.Reason) || '-'}</td>
             <td class="center"><span class="badge ${visitType === 'New' ? 'new' : 'followup'}">${escapeHtml(visitType)}</span></td>
-            <td class="center">${escapeHtml(b['Payment Status'])}</td>
+            <td class="center"><span class="paystatus ${paymentStatus === 'Free' ? 'free' : 'paid'}">${escapeHtml(paymentStatus)}</span></td>
             <td class="center"><a class="open-btn" href="${link}" target="_blank">📋 Open</a></td>
           </tr>`;
         })
@@ -589,34 +616,77 @@ function buildDashboardHtml({ clinicName, dateStr, bookings, secret }) {
 <title>Dashboard - ${escapeHtml(clinicName)}</title>
 <style>
   * { box-sizing: border-box; }
-  body { font-family: Arial, Helvetica, sans-serif; margin: 0; padding: 24px; color: #1a1a1a; background: #f7f9f8; }
-  .sheet { max-width: 1000px; margin: 0 auto; }
-  h1 { color: #1a5f3f; font-size: 22px; margin: 0 0 4px; }
-  .sub { color: #666; font-size: 13px; margin: 0 0 20px; }
-  form.datebar { display: flex; gap: 10px; align-items: center; margin-bottom: 18px; background: #fff; padding: 12px 16px; border-radius: 10px; border: 1px solid #d8e3dd; }
-  form.datebar input[type="date"] { padding: 6px 8px; border: 1px solid #bbb; border-radius: 6px; font-size: 14px; }
-  form.datebar button { padding: 7px 16px; background: #1a5f3f; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; }
-  table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 10px; overflow: hidden; }
-  th, td { border-bottom: 1px solid #e5e9e7; padding: 10px 8px; font-size: 13.5px; text-align: left; }
-  th { background: #1a5f3f; color: #fff; font-size: 11.5px; text-transform: uppercase; }
+  body {
+    font-family: 'Segoe UI', Arial, Helvetica, sans-serif;
+    margin: 0; padding: 32px 16px; color: #1f2b26; background: #eef2f0;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; }
+
+  .topbar { display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 22px; flex-wrap: wrap; gap: 12px; }
+  .topbar h1 { color: #14532d; font-size: 23px; margin: 0 0 4px; font-weight: 700; }
+  .topbar .sub { color: #6b7d74; font-size: 13px; margin: 0; }
+
+  .toolbar {
+    display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+    margin-bottom: 20px; background: #fff; padding: 14px 18px; border-radius: 12px;
+    border: 1px solid #e0e9e4; box-shadow: 0 2px 10px rgba(15,60,45,0.04);
+  }
+  .toolbar form { display: flex; gap: 10px; align-items: center; }
+  .toolbar input[type="date"] { padding: 7px 10px; border: 1px solid #cdd9d3; border-radius: 7px; font-size: 13.5px; }
+  .toolbar button[type="submit"] { padding: 8px 18px; background: #14532d; color: #fff; border: none; border-radius: 7px; cursor: pointer; font-size: 13.5px; font-weight: 600; }
+  .toolbar input[type="search"] { flex: 1; min-width: 160px; padding: 8px 12px; border: 1px solid #cdd9d3; border-radius: 7px; font-size: 13.5px; }
+
+  .stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 20px; }
+  .stat-card { background: #fff; border: 1px solid #e0e9e4; border-radius: 12px; padding: 14px 16px; box-shadow: 0 2px 10px rgba(15,60,45,0.04); }
+  .stat-card .num { font-size: 22px; font-weight: 700; color: #14532d; }
+  .stat-card .lbl { font-size: 11px; color: #7c8f85; text-transform: uppercase; letter-spacing: 0.04em; margin-top: 2px; font-weight: 600; }
+
+  table { width: 100%; border-collapse: separate; border-spacing: 0; background: #fff; border-radius: 12px; overflow: hidden; border: 1px solid #e0e9e4; box-shadow: 0 2px 10px rgba(15,60,45,0.04); }
+  th, td { border-bottom: 1px solid #eef2ef; padding: 11px 10px; font-size: 13.5px; text-align: left; }
+  th { background: #14532d; color: #fff; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: #f7faf8; }
   td.center, th.center { text-align: center; }
-  .badge { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 10.5px; font-weight: bold; }
-  .badge.new { background: #fde7cf; color: #a15c00; }
-  .badge.followup { background: #d9f0e3; color: #1a5f3f; }
-  .open-btn { display: inline-block; padding: 5px 12px; background: #1a5f3f; color: #fff !important; border-radius: 6px; text-decoration: none; font-size: 12.5px; }
-  .empty { text-align: center; color: #999; padding: 24px; }
+  .name-cell { font-weight: 600; }
+  .token-cell { font-weight: 700; color: #14532d; }
+  .reason-cell { color: #556059; }
+  .badge { display: inline-block; padding: 2px 11px; border-radius: 20px; font-size: 10.5px; font-weight: 700; }
+  .badge.new { background: #fdecd4; color: #a15c00; }
+  .badge.followup { background: #dcf1e6; color: #14532d; }
+  .paystatus { font-size: 12px; font-weight: 600; }
+  .paystatus.free { color: #b8862f; }
+  .paystatus.paid { color: #14532d; }
+  .open-btn { display: inline-block; padding: 6px 14px; background: #14532d; color: #fff !important; border-radius: 7px; text-decoration: none; font-size: 12.5px; font-weight: 600; }
+  .open-btn:hover { background: #0f3f22; }
+  .empty { text-align: center; color: #9aa8a1; padding: 30px; }
 </style>
 </head>
 <body>
-<div class="sheet">
-  <h1>${escapeHtml(clinicName)} — Patient Dashboard</h1>
-  <p class="sub">Bookings for the selected date. Bookmark this page for quick access anytime.</p>
+<div class="wrap">
 
-  <form class="datebar" method="get">
-    <input type="hidden" name="secret" value="${escapeHtml(secret)}">
-    <label>Date: <input type="date" name="date" value="${escapeHtml(dateStr)}"></label>
-    <button type="submit">Load</button>
-  </form>
+  <div class="topbar">
+    <div>
+      <h1>${escapeHtml(clinicName)} — Patient Dashboard</h1>
+      <p class="sub">Bookings for ${escapeHtml(dateStr)}. Bookmark this page for quick access anytime.</p>
+    </div>
+  </div>
+
+  <div class="stats">
+    <div class="stat-card"><div class="num">${total}</div><div class="lbl">Total</div></div>
+    <div class="stat-card"><div class="num">${newCount}</div><div class="lbl">New</div></div>
+    <div class="stat-card"><div class="num">${followUpCount}</div><div class="lbl">Follow-up</div></div>
+    <div class="stat-card"><div class="num">${paidCount}</div><div class="lbl">Paid</div></div>
+    <div class="stat-card"><div class="num">${freeCount}</div><div class="lbl">Free</div></div>
+  </div>
+
+  <div class="toolbar">
+    <form method="get">
+      <input type="hidden" name="secret" value="${escapeHtml(secret)}">
+      <label>Date: <input type="date" name="date" value="${escapeHtml(dateStr)}"></label>
+      <button type="submit">Load</button>
+    </form>
+    <input type="search" id="searchBox" placeholder="🔍 Search by patient name..." oninput="filterRows(this.value)">
+  </div>
 
   <table>
     <thead>
@@ -631,11 +701,20 @@ function buildDashboardHtml({ clinicName, dateStr, bookings, secret }) {
         <th class="center">Case Paper</th>
       </tr>
     </thead>
-    <tbody>
+    <tbody id="patientBody">
       ${rowsHtml}
     </tbody>
   </table>
 </div>
+
+<script>
+  function filterRows(query) {
+    const q = query.trim().toLowerCase();
+    document.querySelectorAll('#patientBody tr.patient-row').forEach((row) => {
+      row.style.display = row.dataset.name.includes(q) ? '' : 'none';
+    });
+  }
+</script>
 </body>
 </html>`;
 }
