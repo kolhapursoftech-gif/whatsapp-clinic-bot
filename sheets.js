@@ -117,25 +117,59 @@ async function getSettings() {
 // cache so the next getSettings() call picks up any change immediately.
 async function setSettingValue(key, value) {
   const sheets = await getSheetsClient();
+  console.log(`setSettingValue: writing to spreadsheetId=${SHEET_ID}`);
+
   const { rows } = await readTab('Settings');
 
+  // Debug: dump every key currently in column A, with char codes, so an
+  // invisible/whitespace character mismatch (e.g. from copy-pasting the
+  // template) shows up clearly in the logs instead of silently causing a
+  // duplicate row to be appended instead of the existing one being updated.
+  console.log(
+    'setSettingValue: existing keys in Settings!A ->',
+    rows.map((r, i) => {
+      const raw = r[0] || '';
+      return `[row${i + 2}] "${raw.trim()}" (len=${raw.trim().length}, codes=${[...raw.trim()]
+        .map((c) => c.charCodeAt(0))
+        .join(',')})`;
+    })
+  );
+  console.log(
+    `setSettingValue: looking for key "${key}" (len=${key.length}, codes=${[...key]
+      .map((c) => c.charCodeAt(0))
+      .join(',')})`
+  );
+
   const existingIndex = rows.findIndex((r) => (r[0] || '').trim() === key);
+
   if (existingIndex === -1) {
-    await sheets.spreadsheets.values.append({
+    console.log(`setSettingValue: no existing "${key}" row found — appending new row`);
+    const appendRes = await sheets.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
       range: 'Settings!A:B',
       valueInputOption: 'USER_ENTERED',
       insertDataOption: 'INSERT_ROWS',
       requestBody: { values: [[key, value]] },
     });
+    console.log('setSettingValue: append response range ->', appendRes.data.updates && appendRes.data.updates.updatedRange);
   } else {
     const sheetRowNumber = existingIndex + 2; // +1 header, +1 for 1-indexing
-    await sheets.spreadsheets.values.update({
+    console.log(`setSettingValue: found "${key}" at sheet row ${sheetRowNumber} — updating Settings!B${sheetRowNumber}`);
+    const updateRes = await sheets.spreadsheets.values.update({
       spreadsheetId: SHEET_ID,
       range: `Settings!B${sheetRowNumber}`,
       valueInputOption: 'USER_ENTERED',
       requestBody: { values: [[value]] },
     });
+    console.log('setSettingValue: update response ->', JSON.stringify(updateRes.data));
+
+    // Read the cell straight back so the log proves what's actually sitting
+    // in the Sheet right now, not just what the API claims it wrote.
+    const verify = await sheets.spreadsheets.values.get({
+      spreadsheetId: SHEET_ID,
+      range: `Settings!B${sheetRowNumber}`,
+    });
+    console.log(`setSettingValue: read-back of Settings!B${sheetRowNumber} ->`, JSON.stringify(verify.data.values));
   }
   settingsCache = null; // force a fresh read next time
 }
