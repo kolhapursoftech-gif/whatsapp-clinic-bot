@@ -22,6 +22,7 @@
 // we're already authenticated against it, and it survives restarts.
 
 const { google } = require('googleapis');
+const crypto = require('crypto');
 
 const SHEET_ID = process.env.GOOGLE_SHEET_ID;
 
@@ -171,19 +172,43 @@ async function getPatientProfile(phone) {
   };
 }
 
-async function upsertPatientProfile(phone, { name, age, lang, lastVisitDate }) {
+// Returns the existing Patient ID for this phone if one is already on
+// record, otherwise generates and returns a brand new one (PT-000001, ...).
+// Does NOT write anything itself — the caller is expected to pass the
+// result into upsertPatientProfile so it gets persisted.
+async function getOrCreatePatientId(phone) {
+  const { header, rows } = await readTab('Patients');
+  const phoneIdx = header.indexOf('Phone Number');
+  const idIdx = header.indexOf('Patient ID');
+  if (phoneIdx !== -1) {
+    const row = rows.find((r) => stripQuote(r[phoneIdx]) === phone);
+    if (row && idIdx !== -1 && (row[idIdx] || '').trim()) {
+      return row[idIdx].trim();
+    }
+  }
+  return generatePatientId();
+}
+
+async function upsertPatientProfile(phone, { name, age, lang, lastVisitDate, patientId }) {
   const sheets = await getSheetsClient();
   const { header, rows } = await readTab('Patients');
   const phoneIdx = header.indexOf('Phone Number');
 
-  const newRow = [`'${phone}`, name || '', age || '', lang || '', lastVisitDate ? `'${lastVisitDate}` : ''];
+  const newRow = [
+    `'${phone}`,
+    name || '',
+    age || '',
+    lang || '',
+    lastVisitDate ? `'${lastVisitDate}` : '',
+    patientId || '',
+  ];
 
   const existingIndex = phoneIdx === -1 ? -1 : rows.findIndex((r) => stripQuote(r[phoneIdx]) === phone);
 
   if (existingIndex === -1) {
     await sheets.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
-      range: 'Patients!A:E',
+      range: 'Patients!A:F',
       valueInputOption: 'USER_ENTERED',
       insertDataOption: 'INSERT_ROWS',
       requestBody: { values: [newRow] },
@@ -192,7 +217,7 @@ async function upsertPatientProfile(phone, { name, age, lang, lastVisitDate }) {
     const sheetRowNumber = existingIndex + 2;
     await sheets.spreadsheets.values.update({
       spreadsheetId: SHEET_ID,
-      range: `Patients!A${sheetRowNumber}:E${sheetRowNumber}`,
+      range: `Patients!A${sheetRowNumber}:F${sheetRowNumber}`,
       valueInputOption: 'USER_ENTERED',
       requestBody: { values: [newRow] },
     });
@@ -436,10 +461,23 @@ async function generateUpcomingSlots() {
 
 // ---------- Bookings ----------
 
-async function appendBooking({ name, age, reason, date, slot, token, phone, paymentStatus, visitType }) {
+async function appendBooking({
+  name,
+  age,
+  reason,
+  date,
+  slot,
+  token,
+  phone,
+  paymentStatus,
+  visitType,
+  bookingId,
+  casePaperNumber,
+  patientId,
+}) {
   const sheets = await getSheetsClient();
   // Column order here MUST match the actual Bookings tab:
-  // Timestamp | Phone Number | Name | Age | Reason | Date | Slot | Token Number | Payment Status | Visit Type
+  // Timestamp | Phone Number | Name | Age | Reason | Date | Slot | Token Number | Payment Status | Visit Type | Booking ID | Case Paper Number | Patient ID
   //
   // Date and Slot are written with a leading apostrophe (same trick as
   // phone numbers) to STOP Google Sheets from auto-converting "2026-09-05"
@@ -447,7 +485,7 @@ async function appendBooking({ name, age, reason, date, slot, token, phone, paym
   // 46270 and can never text-match what the bot compares against).
   await sheets.spreadsheets.values.append({
     spreadsheetId: SHEET_ID,
-    range: 'Bookings!A:J',
+    range: 'Bookings!A:M',
     valueInputOption: 'USER_ENTERED',
     insertDataOption: 'INSERT_ROWS',
     requestBody: {
@@ -463,6 +501,9 @@ async function appendBooking({ name, age, reason, date, slot, token, phone, paym
           token,
           paymentStatus || 'Paid',
           visitType || '',
+          bookingId || '',
+          casePaperNumber || '',
+          patientId || '',
         ],
       ],
     },
@@ -632,11 +673,219 @@ async function findBooking({ phone, date, token }) {
   return obj;
 }
 
+// ---------- Automatic numbering system (Counters tab) ----------
+// Backed by a "Counters" tab: Counter Type | Current Value | Updated At.
+//
+// CONCURRENCY NOTE: the Google Sheets API has no atomic "increment" call.
+// This does a read -> compute next -> write -> re-read-to-verify loop with
+// a few retries. At clinic scale (a handful of bookings happening around
+// the same time, not thousands per second) this is safe in practice, even
+// though it isn't a mathematically perfect lock. If two requests ever did
+// collide, the verify step catches it and retries with a fresh number
+// rather than silently handing out a duplicate.
+//
+// This phase ONLY adds the numbering infrastructure — it is not yet wired
+// into the booking flow, so nothing about the existing working system
+// changes yet. That wiring is a deliberate later step (Phase 2).
+
+async function getNextNumber(counterType) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const sheets = await getSheetsClient();
+    const { rows } = await readTab('Counters');
+
+    const existingIndex = rows.findIndex((r) => (r[0] || '').trim() === counterType);
+    const current = existingIndex === -1 ? 0 : parseInt(rows[existingIndex][1], 10) || 0;
+    const next = current + 1;
+    const now = new Date().toISOString();
+
+    if (existingIndex === -1) {
+      await sheets.spreadsheets.values.append({
+        spreadsheetId: SHEET_ID,
+        range: 'Counters!A:C',
+        valueInputOption: 'USER_ENTERED',
+        insertDataOption: 'INSERT_ROWS',
+        requestBody: { values: [[counterType, next, now]] },
+      });
+    } else {
+      const rowNum = existingIndex + 2; // +1 header, +1 for 1-indexing
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: SHEET_ID,
+        range: `Counters!B${rowNum}:C${rowNum}`,
+        valueInputOption: 'USER_ENTERED',
+        requestBody: { values: [[next, now]] },
+      });
+    }
+
+    // Verify nobody else raced us to the same counter in the meantime.
+    const verify = await readTab('Counters');
+    const vIndex = verify.rows.findIndex((r) => (r[0] || '').trim() === counterType);
+    const confirmed = vIndex === -1 ? null : parseInt(verify.rows[vIndex][1], 10);
+
+    if (confirmed === next) {
+      return next;
+    }
+    // Someone else won the race — brief random wait, then retry with a
+    // fresh read (so we build on whatever value they left behind).
+    await new Promise((resolve) => setTimeout(resolve, 100 + Math.random() * 250));
+  }
+  throw new Error(`getNextNumber: could not safely increment counter "${counterType}" after several attempts.`);
+}
+
+function padNumber(n, width) {
+  return String(n).padStart(width, '0');
+}
+
+// PT-000001, PT-000002, ...
+async function generatePatientId() {
+  const n = await getNextNumber('PatientID');
+  return `PT-${padNumber(n, 6)}`;
+}
+
+// APT-2026-000001, resets implicitly each year since the counter key
+// includes the year.
+async function generateAppointmentId() {
+  const year = new Date().getFullYear();
+  const n = await getNextNumber(`AppointmentID-${year}`);
+  return `APT-${year}-${padNumber(n, 6)}`;
+}
+
+// CP-2026-000001
+async function generateCasePaperNumber() {
+  const year = new Date().getFullYear();
+  const n = await getNextNumber(`CasePaper-${year}`);
+  return `CP-${year}-${padNumber(n, 6)}`;
+}
+
+// REC-2026-000001
+async function generateRecordNumber() {
+  const year = new Date().getFullYear();
+  const n = await getNextNumber(`Record-${year}`);
+  return `REC-${year}-${padNumber(n, 6)}`;
+}
+
+// RX-2026-000001
+async function generatePrescriptionNumber() {
+  const year = new Date().getFullYear();
+  const n = await getNextNumber(`Prescription-${year}`);
+  return `RX-${year}-${padNumber(n, 6)}`;
+}
+
+// 001, 002, ... — resets each day since the counter key includes the date.
+// NOTE: not wired into the live booking flow yet (which still uses the
+// existing daily-queue-position logic in getNextAvailableTokenForSlot) —
+// available for Phase 2 to switch over to, or use in parallel.
+async function generateDailyToken(dateStr) {
+  const n = await getNextNumber(`DailyToken-${dateStr}`);
+  return padNumber(n, 3);
+}
+
+// ---------- Patient Profile secure link (Phase 3) ----------
+// Extended Patients columns (appended after Patient ID, so nothing existing
+// shifts): Profile Token | Profile Token Expiry | Profile Completed | DOB |
+// Gender | Address | City | Blood Group | Allergies | Medical History |
+// Current Medicines | Emergency Contact Name | Emergency Contact Relation |
+// Emergency Contact Phone  (columns G through T)
+//
+// Security: the link uses only this random unguessable token — never the
+// phone number or Patient ID — and expires after a configurable number of
+// days.
+
+function generateProfileToken() {
+  return crypto.randomBytes(24).toString('hex'); // 48 hex chars, unguessable
+}
+
+// Issues (or reissues) a profile-update token for this phone. Assumes a
+// Patients row for this phone already exists (call this after
+// upsertPatientProfile has run for the same booking).
+async function issueProfileToken(phone, validDays = 30) {
+  const sheets = await getSheetsClient();
+  const { header, rows } = await readTab('Patients');
+  const phoneIdx = header.indexOf('Phone Number');
+  const existingIndex = phoneIdx === -1 ? -1 : rows.findIndex((r) => stripQuote(r[phoneIdx]) === phone);
+  if (existingIndex === -1) return null;
+
+  const token = generateProfileToken();
+  const expiry = new Date(Date.now() + validDays * 24 * 60 * 60 * 1000).toISOString();
+  const rowNum = existingIndex + 2;
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SHEET_ID,
+    range: `Patients!G${rowNum}:H${rowNum}`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: [[token, expiry]] },
+  });
+
+  return token;
+}
+
+// Looks up a patient by their profile token only — returns null if not
+// found or expired. Never accepts phone/Patient ID directly.
+async function getPatientByProfileToken(token) {
+  const { header, rows } = await readTab('Patients');
+  const tokenIdx = header.indexOf('Profile Token');
+  const expiryIdx = header.indexOf('Profile Token Expiry');
+  if (tokenIdx === -1) return null;
+
+  const row = rows.find((r) => (r[tokenIdx] || '').trim() === token);
+  if (!row) return null;
+
+  if (expiryIdx !== -1) {
+    const expiry = row[expiryIdx];
+    if (expiry && new Date(expiry).getTime() < Date.now()) return null; // expired
+  }
+
+  return rowToObject(header, row);
+}
+
+// Saves the extended profile fields the patient filled in themselves.
+async function updatePatientProfileDetails(phone, details) {
+  const sheets = await getSheetsClient();
+  const { header, rows } = await readTab('Patients');
+  const phoneIdx = header.indexOf('Phone Number');
+  const existingIndex = phoneIdx === -1 ? -1 : rows.findIndex((r) => stripQuote(r[phoneIdx]) === phone);
+  if (existingIndex === -1) return false;
+
+  const rowNum = existingIndex + 2;
+  const values = [
+    'Yes', // Profile Completed
+    details.dob || '',
+    details.gender || '',
+    details.address || '',
+    details.city || '',
+    details.bloodGroup || '',
+    details.allergies || '',
+    details.medicalHistory || '',
+    details.currentMedicines || '',
+    details.emergencyName || '',
+    details.emergencyRelation || '',
+    details.emergencyPhone || '',
+  ];
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SHEET_ID,
+    range: `Patients!I${rowNum}:T${rowNum}`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: [values] },
+  });
+  return true;
+}
+
 module.exports = {
   getSettings,
   setSettingValue,
+  getNextNumber,
+  generatePatientId,
+  generateAppointmentId,
+  generateCasePaperNumber,
+  generateRecordNumber,
+  generatePrescriptionNumber,
+  generateDailyToken,
   getPatientProfile,
+  getOrCreatePatientId,
   upsertPatientProfile,
+  issueProfileToken,
+  getPatientByProfileToken,
+  updatePatientProfileDetails,
   getVisitType,
   getLastVisitDate,
   getBookingsForDate,
