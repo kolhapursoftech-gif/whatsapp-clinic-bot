@@ -904,6 +904,117 @@ async function updatePatientProfileDetails(phone, details) {
   return true;
 }
 
+// ---------- Dashboard v2: hospital-management-style data helpers ----------
+// Everything below reads/writes the same four tabs (Patients, Bookings,
+// Capacity, Medicines) that already exist — no new tabs or schema changes,
+// just more ways to slice the same data for the staff dashboard.
+
+// Every patient ever booked, for the Patients tab of the dashboard
+// (search-by-name/phone, see last visit at a glance).
+async function getAllPatients() {
+  let header, rows;
+  try {
+    ({ header, rows } = await readTab('Patients'));
+  } catch (err) {
+    console.error('getAllPatients: could not read "Patients" tab. Error:', err.message);
+    return [];
+  }
+  return rows.map((r) => {
+    const obj = rowToObject(header, r);
+    return {
+      phone: stripQuote(obj['Phone Number'] || ''),
+      name: obj.Name || '',
+      age: obj.Age || '',
+      lang: obj.Lang || '',
+      lastVisitDate: stripQuote(obj['Last Visit Date'] || ''),
+      patientId: obj['Patient ID'] || '',
+    };
+  });
+}
+
+// Every booking a given phone number has ever made, newest first — powers
+// the "click a patient, see their full history" view.
+async function getBookingsForPhone(phone) {
+  const { header, rows } = await readTab('Bookings');
+  const phoneIdx = header.indexOf('Phone Number');
+  if (phoneIdx === -1) return [];
+  return rows
+    .filter((r) => stripQuote(r[phoneIdx]) === phone)
+    .map((r) => {
+      const obj = rowToObject(header, r);
+      obj.Date = stripQuote(obj.Date);
+      obj.Slot = stripQuote(obj.Slot);
+      obj['Phone Number'] = stripQuote(obj['Phone Number']);
+      return obj;
+    })
+    .sort((a, b) => (a.Date < b.Date ? 1 : a.Date > b.Date ? -1 : 0));
+}
+
+// Every booking between two YYYY-MM-DD dates (inclusive) — powers the
+// Calendar/week view and the Payments/Revenue summary. Plain string
+// comparison works fine since the format is always YYYY-MM-DD.
+async function getBookingsInRange(startStr, endStr) {
+  const { header, rows } = await readTab('Bookings');
+  const dateIdx = header.indexOf('Date');
+  if (dateIdx === -1) return [];
+  return rows
+    .filter((r) => {
+      const d = stripQuote(r[dateIdx]).trim();
+      return d >= startStr && d <= endStr;
+    })
+    .map((r) => {
+      const obj = rowToObject(header, r);
+      obj.Date = stripQuote(obj.Date);
+      obj.Slot = stripQuote(obj.Slot);
+      obj['Phone Number'] = stripQuote(obj['Phone Number']);
+      return obj;
+    });
+}
+
+// Every slot configured for one date, WITH its live booked count and its
+// actual row number in the Capacity tab (so the dashboard can edit Max
+// Capacity in place without re-scanning the whole tab on every save).
+async function getCapacityForDate(dateStr) {
+  const { header, rows } = await readTab('Capacity');
+  const dateIdx = header.indexOf('Date');
+  const slotIdx = header.indexOf('Slot');
+  const capIdx = header.indexOf('Max Capacity');
+  if (dateIdx === -1 || slotIdx === -1 || capIdx === -1) return [];
+
+  const bookingsTab = await readTab('Bookings');
+  const bDateIdx = bookingsTab.header.indexOf('Date');
+  const bSlotIdx = bookingsTab.header.indexOf('Slot');
+
+  const result = [];
+  rows.forEach((r, i) => {
+    const rDate = stripQuote(r[dateIdx]).trim();
+    if (rDate !== dateStr.trim()) return;
+    const slot = stripQuote(r[slotIdx]).trim();
+    const maxCapacity = parseInt(r[capIdx], 10) || 0;
+    const booked =
+      bDateIdx === -1 || bSlotIdx === -1
+        ? 0
+        : bookingsTab.rows.filter(
+            (br) => stripQuote(br[bDateIdx]).trim() === rDate && stripQuote(br[bSlotIdx]).trim() === slot
+          ).length;
+    result.push({ rowNumber: i + 2, slot, maxCapacity, booked });
+  });
+  return result.sort((a, b) => (parseTimeToMinutes(a.slot) || 0) - (parseTimeToMinutes(b.slot) || 0));
+}
+
+// Edits Max Capacity for one already-existing Capacity row (found via the
+// rowNumber returned by getCapacityForDate) — e.g. staff closing a slot by
+// setting it to 0, or opening extra room for a busy day.
+async function updateCapacitySlotByRow(rowNumber, newMaxCapacity) {
+  const sheets = await getSheetsClient();
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SHEET_ID,
+    range: `Capacity!C${rowNumber}`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: [[newMaxCapacity]] },
+  });
+}
+
 module.exports = {
   getSettings,
   setSettingValue,
@@ -933,4 +1044,9 @@ module.exports = {
   setPendingState,
   clearPendingState,
   findPendingByLastDigits,
+  getAllPatients,
+  getBookingsForPhone,
+  getBookingsInRange,
+  getCapacityForDate,
+  updateCapacitySlotByRow,
 };
