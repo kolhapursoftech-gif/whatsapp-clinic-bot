@@ -8,6 +8,7 @@ const { getMessages, LANGUAGE_BUTTONS, languagePrompt, SAME_PATIENT_BUTTONS } = 
 
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 const CLINIC_NAME_FALLBACK = process.env.CLINIC_NAME || 'the clinic';
 const DOCTOR_NUMBER = process.env.DOCTOR_WHATSAPP_NUMBER; // fallback if Settings tab has none
@@ -206,6 +207,9 @@ async function movePatientToPaymentStep(phone, state, settingsObj) {
 
 async function finalizeBooking(phone, name, age, reason, dateStr, slot, token, opts = {}) {
   const visitType = await sheets.getVisitType(phone);
+  const patientId = await sheets.getOrCreatePatientId(phone);
+  const bookingId = await sheets.generateAppointmentId();
+  const casePaperNumber = await sheets.generateCasePaperNumber();
 
   await sheets.appendBooking({
     name,
@@ -217,22 +221,36 @@ async function finalizeBooking(phone, name, age, reason, dateStr, slot, token, o
     phone,
     paymentStatus: opts.paymentStatus || 'Paid',
     visitType,
+    bookingId,
+    casePaperNumber,
+    patientId,
   });
-  await sheets.upsertPatientProfile(phone, { name, age, lang: opts.lang, lastVisitDate: dateStr });
+  await sheets.upsertPatientProfile(phone, { name, age, lang: opts.lang, lastVisitDate: dateStr, patientId });
   await sheets.clearPendingState(phone);
 
   const M = getMessages(opts.lang);
   await whatsapp.sendText(
     phone,
-    M.bookingConfirmed(opts.clinicName || CLINIC_NAME_FALLBACK, name, token, dateStr, slot)
+    M.bookingConfirmed(opts.clinicName || CLINIC_NAME_FALLBACK, name, token, dateStr, slot, patientId, bookingId)
   );
+
+  if (APP_BASE_URL) {
+    try {
+      const profileToken = await sheets.issueProfileToken(phone);
+      if (profileToken) {
+        await whatsapp.sendText(phone, M.profileLinkMessage(`${APP_BASE_URL}/patient-profile/${profileToken}`));
+      }
+    } catch (err) {
+      console.error('Could not issue/send profile link:', err.message);
+    }
+  }
 
   const notifyNumber = opts.staffNumber || DOCTOR_NUMBER;
   if (notifyNumber) {
     const casePaperLink = buildCasePaperLink({ phone, date: dateStr, token });
     await whatsapp.sendText(
       notifyNumber,
-      `Naveen Booking: ${name} (${age}) - Token #${token} - ${dateStr} ${slot} - ${visitType} (Payment: ${opts.paymentStatus || 'Paid'})\nKaran: ${reason || '-'}\n\n📋 Case Paper: ${casePaperLink}`
+      `Naveen Booking: ${name} (${age}) - Token #${token} - ${dateStr} ${slot} - ${visitType} (Payment: ${opts.paymentStatus || 'Paid'})\nKaran: ${reason || '-'}\n🆔 ${patientId} | ${bookingId} | ${casePaperNumber}\n\n📋 Case Paper: ${casePaperLink}`
     );
   }
 }
@@ -336,6 +354,8 @@ function buildCasePaperHtml({
   slot,
   token,
   visitType,
+  patientId,
+  casePaperNumber,
   medicines = [],
 }) {
   const rxRowTemplate = () => `
@@ -438,6 +458,7 @@ function buildCasePaperHtml({
     <h1>${escapeHtml(clinicName)}</h1>
     ${contactLine ? `<p class="contact">${escapeHtml(contactLine)}</p>` : ''}
     <p class="subtitle">Case Paper &amp; Prescription</p>
+    ${casePaperNumber || patientId ? `<p class="contact">${[casePaperNumber, patientId ? `Patient ID: ${patientId}` : ''].filter(Boolean).map(escapeHtml).join('  •  ')}</p>` : ''}
   </div>
 
   <div class="patient-info">
@@ -555,6 +576,8 @@ app.get('/case-paper', async (req, res) => {
       slot: booking.Slot,
       token: booking['Token Number'],
       visitType: booking['Visit Type'],
+      patientId: booking['Patient ID'],
+      casePaperNumber: booking['Case Paper Number'],
       medicines,
     });
 
@@ -742,6 +765,141 @@ app.get('/dashboard', async (req, res) => {
   } catch (err) {
     console.error('dashboard error:', err.message);
     res.status(500).send('Error loading dashboard: ' + err.message);
+  }
+});
+
+// ---------- 2e. Patient profile page (secure token link, Phase 3) ----------
+
+function buildPatientProfileFormHtml({ clinicName, patient, token }) {
+  const val = (key) => escapeHtml(patient[key] || '');
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Patient Profile - ${escapeHtml(clinicName)}</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: 'Segoe UI', Arial, sans-serif; margin: 0; padding: 24px 16px; background: #eef2f0; color: #1f2b26; }
+  .card { max-width: 560px; margin: 0 auto; background: #fff; border-radius: 14px; box-shadow: 0 4px 24px rgba(15,60,45,0.08); padding: 32px; }
+  h1 { color: #14532d; font-size: 20px; margin: 0 0 4px; }
+  p.sub { color: #6b7d74; font-size: 13px; margin: 0 0 22px; }
+  label { display: block; font-size: 12.5px; font-weight: 600; color: #3f5148; margin: 14px 0 5px; }
+  input, select, textarea { width: 100%; padding: 9px 11px; border: 1px solid #cdd9d3; border-radius: 8px; font-size: 14px; font-family: inherit; }
+  textarea { resize: vertical; min-height: 60px; }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }
+  button { margin-top: 22px; width: 100%; padding: 12px; background: #14532d; color: #fff; border: none; border-radius: 9px; font-size: 15px; font-weight: 600; cursor: pointer; }
+  button:hover { background: #0f3f22; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>${escapeHtml(clinicName)} — Patient Profile</h1>
+    <p class="sub">Hi ${val('Name')}, please fill in a few extra details so the clinic has your complete profile.</p>
+    <form method="POST" action="/patient-profile/${escapeHtml(token)}">
+      <div class="row2">
+        <div><label>Date of Birth</label><input type="date" name="dob" value="${val('DOB')}"></div>
+        <div><label>Gender</label>
+          <select name="gender">
+            <option value="">Select</option>
+            <option value="Male" ${patient.Gender === 'Male' ? 'selected' : ''}>Male</option>
+            <option value="Female" ${patient.Gender === 'Female' ? 'selected' : ''}>Female</option>
+            <option value="Other" ${patient.Gender === 'Other' ? 'selected' : ''}>Other</option>
+          </select>
+        </div>
+      </div>
+      <label>Address</label>
+      <input type="text" name="address" value="${val('Address')}" placeholder="House/Street">
+      <div class="row2">
+        <div><label>City</label><input type="text" name="city" value="${val('City')}"></div>
+        <div><label>Blood Group</label><input type="text" name="bloodGroup" value="${val('Blood Group')}" placeholder="e.g. O+"></div>
+      </div>
+      <label>Allergies</label>
+      <textarea name="allergies" placeholder="e.g. Penicillin, dust">${val('Allergies')}</textarea>
+      <label>Previous Medical History</label>
+      <textarea name="medicalHistory" placeholder="e.g. Diabetes, past surgeries">${val('Medical History')}</textarea>
+      <label>Current Medicines</label>
+      <textarea name="currentMedicines" placeholder="Any medicines you take regularly">${val('Current Medicines')}</textarea>
+      <label>Emergency Contact Name</label>
+      <input type="text" name="emergencyName" value="${val('Emergency Contact Name')}">
+      <div class="row2">
+        <div><label>Relation</label><input type="text" name="emergencyRelation" value="${val('Emergency Contact Relation')}" placeholder="e.g. Spouse"></div>
+        <div><label>Phone</label><input type="tel" name="emergencyPhone" value="${val('Emergency Contact Phone')}"></div>
+      </div>
+      <button type="submit">Save Profile</button>
+    </form>
+  </div>
+</body>
+</html>`;
+}
+
+function buildProfileSavedHtml(clinicName) {
+  return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Profile Saved</title>
+<style>
+  body { font-family: 'Segoe UI', Arial, sans-serif; background: #eef2f0; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+  .card { background: #fff; border-radius: 14px; box-shadow: 0 4px 24px rgba(15,60,45,0.08); padding: 40px; text-align: center; max-width: 380px; }
+  .tick { font-size: 42px; }
+  h1 { color: #14532d; font-size: 19px; margin: 12px 0 6px; }
+  p { color: #6b7d74; font-size: 13.5px; }
+</style></head>
+<body>
+  <div class="card">
+    <div class="tick">✅</div>
+    <h1>Profile Updated!</h1>
+    <p>Your information has been saved successfully at ${escapeHtml(clinicName)}. You can close this page now.</p>
+  </div>
+</body></html>`;
+}
+
+// Example link sent to patients: https://your-app.onrender.com/patient-profile/<random-token>
+app.get('/patient-profile/:token', async (req, res) => {
+  try {
+    const patient = await sheets.getPatientByProfileToken(req.params.token);
+    if (!patient) {
+      return res.status(404).send('This link is invalid or has expired. Please contact the clinic for a new link.');
+    }
+    const settings = await sheets.getSettings();
+    const html = buildPatientProfileFormHtml({
+      clinicName: settings.clinicName || CLINIC_NAME_FALLBACK,
+      patient,
+      token: req.params.token,
+    });
+    res.set('Content-Type', 'text/html');
+    res.send(html);
+  } catch (err) {
+    console.error('patient-profile GET error:', err.message);
+    res.status(500).send('Error loading profile page: ' + err.message);
+  }
+});
+
+app.post('/patient-profile/:token', async (req, res) => {
+  try {
+    const patient = await sheets.getPatientByProfileToken(req.params.token);
+    if (!patient) {
+      return res.status(404).send('This link is invalid or has expired. Please contact the clinic for a new link.');
+    }
+    const phone = String(patient['Phone Number'] || '').replace(/^'/, '');
+    await sheets.updatePatientProfileDetails(phone, {
+      dob: req.body.dob,
+      gender: req.body.gender,
+      address: req.body.address,
+      city: req.body.city,
+      bloodGroup: req.body.bloodGroup,
+      allergies: req.body.allergies,
+      medicalHistory: req.body.medicalHistory,
+      currentMedicines: req.body.currentMedicines,
+      emergencyName: req.body.emergencyName,
+      emergencyRelation: req.body.emergencyRelation,
+      emergencyPhone: req.body.emergencyPhone,
+    });
+    const settings = await sheets.getSettings();
+    res.set('Content-Type', 'text/html');
+    res.send(buildProfileSavedHtml(settings.clinicName || CLINIC_NAME_FALLBACK));
+  } catch (err) {
+    console.error('patient-profile POST error:', err.message);
+    res.status(500).send('Error saving profile: ' + err.message);
   }
 });
 
