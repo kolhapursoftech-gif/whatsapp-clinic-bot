@@ -589,48 +589,211 @@ app.get('/case-paper', async (req, res) => {
   }
 });
 
-// ---------- 2d. Staff/doctor dashboard — browse any day's patients from a PC ----------
-// Unlike the one-off case-paper link sent via WhatsApp at booking time, this
-// page can be opened anytime (bookmark it) and lets staff pick a date and
-// jump straight into any patient's case paper.
+// ---------- 2d. Staff/doctor dashboard — full hospital-style admin panel ----------
+// One page, several tabs (all client-rendered from the JSON API endpoints
+// below): Today's Queue, Calendar, Patients, Payments, Capacity, Medicines.
+// Bookmark it once — the secret stays in the URL/localStorage so staff never
+// have to retype it.
 
-function buildDashboardHtml({ clinicName, dateStr, bookings, secret }) {
-  const total = bookings.length;
-  const newCount = bookings.filter((b) => b['Visit Type'] === 'New').length;
-  const followUpCount = bookings.filter((b) => b['Visit Type'] === 'Follow-up').length;
-  const paidCount = bookings.filter((b) => b['Payment Status'] === 'Paid').length;
-  const freeCount = bookings.filter((b) => b['Payment Status'] === 'Free').length;
+function requireSecret(req, res) {
+  const secret = req.query.secret || (req.body && req.body.secret);
+  if (secret !== TRIGGER_SECRET) {
+    res.status(401).json({ error: 'Invalid or missing secret' });
+    return false;
+  }
+  return true;
+}
 
-  const rowsHtml = bookings.length
-    ? bookings
-        .map((b) => {
-          const phone = String(b['Phone Number'] || '').replace(/^'/, '');
-          const bookingDate = String(b['Date'] || '').replace(/^'/, '');
-          const slot = String(b['Slot'] || '').replace(/^'/, '');
-          const tokenVal = b['Token Number'];
-          const link = `/case-paper?${new URLSearchParams({
-            secret,
-            phone,
-            date: bookingDate,
-            token: String(tokenVal),
-          }).toString()}`;
-          const visitType = b['Visit Type'] || '';
-          const paymentStatus = b['Payment Status'] || '';
-          return `
-          <tr class="patient-row" data-name="${escapeHtml((b.Name || '').toLowerCase())}">
-            <td class="center token-cell">${escapeHtml(tokenVal)}</td>
-            <td class="name-cell">${escapeHtml(b.Name)}</td>
-            <td class="center">${escapeHtml(b.Age)}</td>
-            <td class="center">${escapeHtml(slot)}</td>
-            <td class="reason-cell">${escapeHtml(b.Reason) || '-'}</td>
-            <td class="center"><span class="badge ${visitType === 'New' ? 'new' : 'followup'}">${escapeHtml(visitType)}</span></td>
-            <td class="center"><span class="paystatus ${paymentStatus === 'Free' ? 'free' : 'paid'}">${escapeHtml(paymentStatus)}</span></td>
-            <td class="center"><a class="open-btn" href="${link}" target="_blank">📋 Open</a></td>
-          </tr>`;
-        })
-        .join('')
-    : `<tr><td colspan="8" class="empty">No bookings for this date yet.</td></tr>`;
+function feeForVisitType(settings, visitType) {
+  const raw =
+    visitType === 'New' ? settings.newPatientFee : visitType === 'Follow-up' ? settings.followUpFee : settings.feeAmount;
+  const n = parseFloat(raw);
+  return isNaN(n) ? 0 : n;
+}
 
+// ---- Read-only JSON APIs ----
+
+app.get('/api/bookings-range', async (req, res) => {
+  if (!requireSecret(req, res)) return;
+  try {
+    const start = req.query.start || istDateString(0);
+    const end = req.query.end || start;
+    const [bookings, settings] = await Promise.all([sheets.getBookingsInRange(start, end), sheets.getSettings()]);
+
+    let revenue = 0;
+    let paidCount = 0;
+    let freeCount = 0;
+    const byDate = {};
+    bookings.forEach((b) => {
+      const d = b.Date;
+      byDate[d] = byDate[d] || { date: d, total: 0, new: 0, followUp: 0, revenue: 0 };
+      byDate[d].total += 1;
+      if (b['Visit Type'] === 'New') byDate[d].new += 1;
+      if (b['Visit Type'] === 'Follow-up') byDate[d].followUp += 1;
+      if (b['Payment Status'] === 'Paid') {
+        paidCount += 1;
+        const fee = feeForVisitType(settings, b['Visit Type']);
+        revenue += fee;
+        byDate[d].revenue += fee;
+      } else if (b['Payment Status'] === 'Free') {
+        freeCount += 1;
+      }
+    });
+
+    res.json({
+      start,
+      end,
+      bookings,
+      summary: {
+        total: bookings.length,
+        paidCount,
+        freeCount,
+        revenue,
+        newCount: bookings.filter((b) => b['Visit Type'] === 'New').length,
+        followUpCount: bookings.filter((b) => b['Visit Type'] === 'Follow-up').length,
+        byDate: Object.values(byDate).sort((a, b) => (a.date < b.date ? -1 : 1)),
+      },
+    });
+  } catch (err) {
+    console.error('api/bookings-range error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/patients', async (req, res) => {
+  if (!requireSecret(req, res)) return;
+  try {
+    const q = (req.query.q || '').trim().toLowerCase();
+    let patients = await sheets.getAllPatients();
+    if (q) {
+      patients = patients.filter(
+        (p) => p.name.toLowerCase().includes(q) || p.phone.includes(q) || p.patientId.toLowerCase().includes(q)
+      );
+    }
+    patients.sort((a, b) => (a.lastVisitDate < b.lastVisitDate ? 1 : -1));
+    res.json({ patients });
+  } catch (err) {
+    console.error('api/patients error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/patient-history', async (req, res) => {
+  if (!requireSecret(req, res)) return;
+  try {
+    const phone = (req.query.phone || '').replace(/\D/g, '');
+    if (!phone) return res.status(400).json({ error: 'phone is required' });
+    const [profile, bookings] = await Promise.all([sheets.getPatientProfile(phone), sheets.getBookingsForPhone(phone)]);
+    res.json({ profile, bookings });
+  } catch (err) {
+    console.error('api/patient-history error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/capacity', async (req, res) => {
+  if (!requireSecret(req, res)) return;
+  try {
+    const dateStr = req.query.date || istDateString(0);
+    const slots = await sheets.getCapacityForDate(dateStr);
+    res.json({ date: dateStr, slots });
+  } catch (err) {
+    console.error('api/capacity error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/capacity/update', async (req, res) => {
+  if (!requireSecret(req, res)) return;
+  try {
+    const rowNumber = parseInt(req.body.rowNumber, 10);
+    const maxCapacity = parseInt(req.body.maxCapacity, 10);
+    if (!rowNumber || isNaN(maxCapacity) || maxCapacity < 0) {
+      return res.status(400).json({ error: 'rowNumber and a valid maxCapacity are required' });
+    }
+    await sheets.updateCapacitySlotByRow(rowNumber, maxCapacity);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('api/capacity/update error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/medicines', async (req, res) => {
+  if (!requireSecret(req, res)) return;
+  try {
+    const medicines = await sheets.getMedicineDatabase();
+    res.json({ medicines });
+  } catch (err) {
+    console.error('api/medicines error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---- Walk-in booking (staff adds a patient directly from the dashboard,
+// no WhatsApp conversation needed) — reuses the exact same finalizeBooking
+// path as the bot, so numbering, Patients tab, and the staff WhatsApp
+// notification all stay consistent with normal bookings. ----
+
+app.post('/api/walkin', async (req, res) => {
+  if (!requireSecret(req, res)) return;
+  try {
+    const phone = (req.body.phone || '').replace(/\D/g, '');
+    const name = (req.body.name || '').trim();
+    const age = (req.body.age || '').trim();
+    const reason = (req.body.reason || '').trim();
+    const date = (req.body.date || istDateString(0)).trim();
+    const slot = (req.body.slot || '').trim();
+    const paymentStatus = req.body.paymentStatus === 'Free' ? 'Free' : 'Paid';
+
+    if (!phone || phone.length < 10) return res.status(400).json({ error: 'A valid phone number is required' });
+    if (!name) return res.status(400).json({ error: 'Name is required' });
+    if (!slot) return res.status(400).json({ error: 'Slot is required' });
+
+    const token = await sheets.getNextAvailableTokenForSlot(date, slot);
+    if (!token) return res.status(409).json({ error: 'That slot is full or does not exist — pick another.' });
+
+    const settings = await sheets.getSettings();
+    await finalizeBooking(phone, name, age, reason, date, slot, token, {
+      paymentStatus,
+      clinicName: settings.clinicName || CLINIC_NAME_FALLBACK,
+      staffNumber: settings.staffNumber || DOCTOR_NUMBER,
+      lang: settings.defaultLanguage || 'en',
+    });
+
+    res.json({ ok: true, token, date, slot });
+  } catch (err) {
+    console.error('api/walkin error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---- CSV export ----
+
+app.get('/dashboard/export.csv', async (req, res) => {
+  if (req.query.secret !== TRIGGER_SECRET) return res.sendStatus(401);
+  try {
+    const start = req.query.start || istDateString(0);
+    const end = req.query.end || start;
+    const bookings = await sheets.getBookingsInRange(start, end);
+
+    const cols = ['Date', 'Slot', 'Token Number', 'Name', 'Age', 'Phone Number', 'Reason', 'Visit Type', 'Payment Status'];
+    const csvEscape = (v) => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
+    const lines = [cols.join(',')];
+    bookings.forEach((b) => lines.push(cols.map((c) => csvEscape(b[c])).join(',')));
+
+    res.set('Content-Type', 'text/csv');
+    res.set('Content-Disposition', `attachment; filename="bookings_${start}_to_${end}.csv"`);
+    res.send(lines.join('\n'));
+  } catch (err) {
+    console.error('export.csv error:', err.message);
+    res.status(500).send('Error: ' + err.message);
+  }
+});
+
+// ---- The dashboard app shell itself ----
+
+function buildDashboardAppHtml({ clinicName, secret, todayStr }) {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -639,127 +802,433 @@ function buildDashboardHtml({ clinicName, dateStr, bookings, secret }) {
 <title>Dashboard - ${escapeHtml(clinicName)}</title>
 <style>
   * { box-sizing: border-box; }
-  body {
-    font-family: 'Segoe UI', Arial, Helvetica, sans-serif;
-    margin: 0; padding: 32px 16px; color: #1f2b26; background: #eef2f0;
-  }
-  .wrap { max-width: 1080px; margin: 0 auto; }
+  body { font-family: 'Segoe UI', Arial, Helvetica, sans-serif; margin: 0; padding: 20px 16px 60px; color: #1f2b26; background: #eef2f0; }
+  .wrap { max-width: 1180px; margin: 0 auto; }
+  h1 { color: #14532d; font-size: 21px; margin: 0 0 2px; font-weight: 700; }
+  .sub { color: #6b7d74; font-size: 12.5px; margin: 0 0 16px; }
 
-  .topbar { display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 22px; flex-wrap: wrap; gap: 12px; }
-  .topbar h1 { color: #14532d; font-size: 23px; margin: 0 0 4px; font-weight: 700; }
-  .topbar .sub { color: #6b7d74; font-size: 13px; margin: 0; }
+  .tabs { display: flex; gap: 4px; margin-bottom: 18px; flex-wrap: wrap; background: #fff; padding: 5px; border-radius: 12px; border: 1px solid #e0e9e4; }
+  .tab-btn { padding: 9px 16px; border: none; background: transparent; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 600; color: #4d5e56; }
+  .tab-btn.active { background: #14532d; color: #fff; }
 
-  .toolbar {
-    display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
-    margin-bottom: 20px; background: #fff; padding: 14px 18px; border-radius: 12px;
-    border: 1px solid #e0e9e4; box-shadow: 0 2px 10px rgba(15,60,45,0.04);
-  }
-  .toolbar form { display: flex; gap: 10px; align-items: center; }
-  .toolbar input[type="date"] { padding: 7px 10px; border: 1px solid #cdd9d3; border-radius: 7px; font-size: 13.5px; }
-  .toolbar button[type="submit"] { padding: 8px 18px; background: #14532d; color: #fff; border: none; border-radius: 7px; cursor: pointer; font-size: 13.5px; font-weight: 600; }
-  .toolbar input[type="search"] { flex: 1; min-width: 160px; padding: 8px 12px; border: 1px solid #cdd9d3; border-radius: 7px; font-size: 13.5px; }
+  .card { background: #fff; border: 1px solid #e0e9e4; border-radius: 12px; padding: 16px 18px; box-shadow: 0 2px 10px rgba(15,60,45,0.04); margin-bottom: 16px; }
+  .toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 14px; }
+  input, select { padding: 7px 10px; border: 1px solid #cdd9d3; border-radius: 7px; font-size: 13px; }
+  input[type="search"] { flex: 1; min-width: 160px; }
+  button.primary { padding: 8px 16px; background: #14532d; color: #fff; border: none; border-radius: 7px; cursor: pointer; font-size: 13px; font-weight: 600; }
+  button.primary:hover { background: #0f3f22; }
+  button.secondary { padding: 8px 16px; background: #eef2f0; color: #14532d; border: 1px solid #cdd9d3; border-radius: 7px; cursor: pointer; font-size: 13px; font-weight: 600; }
+  a.btn-link { display: inline-block; padding: 7px 14px; background: #14532d; color: #fff !important; border-radius: 7px; text-decoration: none; font-size: 12.5px; font-weight: 600; }
 
-  .stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 20px; }
-  .stat-card { background: #fff; border: 1px solid #e0e9e4; border-radius: 12px; padding: 14px 16px; box-shadow: 0 2px 10px rgba(15,60,45,0.04); }
-  .stat-card .num { font-size: 22px; font-weight: 700; color: #14532d; }
-  .stat-card .lbl { font-size: 11px; color: #7c8f85; text-transform: uppercase; letter-spacing: 0.04em; margin-top: 2px; font-weight: 600; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; margin-bottom: 16px; }
+  .stat-card { background: #fff; border: 1px solid #e0e9e4; border-radius: 12px; padding: 12px 14px; box-shadow: 0 2px 10px rgba(15,60,45,0.04); }
+  .stat-card .num { font-size: 20px; font-weight: 700; color: #14532d; }
+  .stat-card .lbl { font-size: 10.5px; color: #7c8f85; text-transform: uppercase; letter-spacing: 0.04em; margin-top: 2px; font-weight: 600; }
 
-  table { width: 100%; border-collapse: separate; border-spacing: 0; background: #fff; border-radius: 12px; overflow: hidden; border: 1px solid #e0e9e4; box-shadow: 0 2px 10px rgba(15,60,45,0.04); }
-  th, td { border-bottom: 1px solid #eef2ef; padding: 11px 10px; font-size: 13.5px; text-align: left; }
+  table { width: 100%; border-collapse: separate; border-spacing: 0; background: #fff; border-radius: 12px; overflow: hidden; border: 1px solid #e0e9e4; }
+  th, td { border-bottom: 1px solid #eef2ef; padding: 10px; font-size: 13px; text-align: left; }
   th { background: #14532d; color: #fff; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
   tbody tr:last-child td { border-bottom: none; }
   tbody tr:hover { background: #f7faf8; }
   td.center, th.center { text-align: center; }
-  .name-cell { font-weight: 600; }
-  .token-cell { font-weight: 700; color: #14532d; }
-  .reason-cell { color: #556059; }
   .badge { display: inline-block; padding: 2px 11px; border-radius: 20px; font-size: 10.5px; font-weight: 700; }
   .badge.new { background: #fdecd4; color: #a15c00; }
   .badge.followup { background: #dcf1e6; color: #14532d; }
   .paystatus { font-size: 12px; font-weight: 600; }
   .paystatus.free { color: #b8862f; }
   .paystatus.paid { color: #14532d; }
-  .open-btn { display: inline-block; padding: 6px 14px; background: #14532d; color: #fff !important; border-radius: 7px; text-decoration: none; font-size: 12.5px; font-weight: 600; }
-  .open-btn:hover { background: #0f3f22; }
   .empty { text-align: center; color: #9aa8a1; padding: 30px; }
+  .clickable-row { cursor: pointer; }
+  .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(15,30,20,0.45); align-items: center; justify-content: center; z-index: 50; padding: 16px; }
+  .modal-overlay.open { display: flex; }
+  .modal-box { background: #fff; border-radius: 14px; padding: 22px; max-width: 480px; width: 100%; max-height: 85vh; overflow-y: auto; }
+  .modal-box h2 { margin: 0 0 14px; font-size: 17px; color: #14532d; }
+  .field { margin-bottom: 12px; display: flex; flex-direction: column; gap: 4px; }
+  .field label { font-size: 12px; font-weight: 600; color: #4d5e56; }
+  .field input, .field select { width: 100%; }
+  .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 16px; }
+  .close-x { float: right; cursor: pointer; font-size: 20px; color: #9aa8a1; line-height: 1; }
+  .chart-wrap { overflow-x: auto; }
+  .msg { padding: 10px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 12px; }
+  .msg.err { background: #fdecec; color: #a11616; }
+  .msg.ok { background: #dcf1e6; color: #14532d; }
 </style>
 </head>
 <body>
 <div class="wrap">
+  <h1>${escapeHtml(clinicName)} — Dashboard</h1>
+  <p class="sub">Full patient &amp; clinic management. Bookmark this page.</p>
 
-  <div class="topbar">
-    <div>
-      <h1>${escapeHtml(clinicName)} — Patient Dashboard</h1>
-      <p class="sub">Bookings for ${escapeHtml(dateStr)}. Bookmark this page for quick access anytime.</p>
+  <div class="tabs" id="tabs">
+    <button class="tab-btn" data-tab="today">Today's Queue</button>
+    <button class="tab-btn" data-tab="calendar">Calendar</button>
+    <button class="tab-btn" data-tab="patients">Patients</button>
+    <button class="tab-btn" data-tab="payments">Payments</button>
+    <button class="tab-btn" data-tab="capacity">Capacity</button>
+    <button class="tab-btn" data-tab="medicines">Medicines</button>
+  </div>
+
+  <div id="content"></div>
+</div>
+
+<div class="modal-overlay" id="walkinModal">
+  <div class="modal-box">
+    <span class="close-x" onclick="closeWalkinModal()">&times;</span>
+    <h2>Add Walk-in Patient</h2>
+    <div id="walkinMsg"></div>
+    <div class="field"><label>Name</label><input id="wName" placeholder="Patient name"></div>
+    <div class="field"><label>Phone (10 digit)</label><input id="wPhone" placeholder="9876543210"></div>
+    <div class="field"><label>Age</label><input id="wAge" placeholder="Age"></div>
+    <div class="field"><label>Reason (optional)</label><input id="wReason" placeholder="Reason for visit"></div>
+    <div class="field"><label>Date</label><input id="wDate" type="date"></div>
+    <div class="field"><label>Slot</label><select id="wSlot"><option value="">Pick a date first</option></select></div>
+    <div class="field"><label>Payment</label><select id="wPayment"><option value="Paid">Paid</option><option value="Free">Free</option></select></div>
+    <div class="modal-actions">
+      <button class="secondary" onclick="closeWalkinModal()">Cancel</button>
+      <button class="primary" onclick="submitWalkin()">Add Booking</button>
     </div>
   </div>
+</div>
 
-  <div class="stats">
-    <div class="stat-card"><div class="num">${total}</div><div class="lbl">Total</div></div>
-    <div class="stat-card"><div class="num">${newCount}</div><div class="lbl">New</div></div>
-    <div class="stat-card"><div class="num">${followUpCount}</div><div class="lbl">Follow-up</div></div>
-    <div class="stat-card"><div class="num">${paidCount}</div><div class="lbl">Paid</div></div>
-    <div class="stat-card"><div class="num">${freeCount}</div><div class="lbl">Free</div></div>
+<div class="modal-overlay" id="historyModal">
+  <div class="modal-box">
+    <span class="close-x" onclick="document.getElementById('historyModal').classList.remove('open')">&times;</span>
+    <h2 id="historyTitle">Patient History</h2>
+    <div id="historyBody"></div>
   </div>
-
-  <div class="toolbar">
-    <form method="get">
-      <input type="hidden" name="secret" value="${escapeHtml(secret)}">
-      <label>Date: <input type="date" name="date" value="${escapeHtml(dateStr)}"></label>
-      <button type="submit">Load</button>
-    </form>
-    <input type="search" id="searchBox" placeholder="🔍 Search by patient name..." oninput="filterRows(this.value)">
-  </div>
-
-  <table>
-    <thead>
-      <tr>
-        <th class="center">Token</th>
-        <th>Name</th>
-        <th class="center">Age</th>
-        <th class="center">Time</th>
-        <th>Reason</th>
-        <th class="center">Visit Type</th>
-        <th class="center">Payment</th>
-        <th class="center">Case Paper</th>
-      </tr>
-    </thead>
-    <tbody id="patientBody">
-      ${rowsHtml}
-    </tbody>
-  </table>
 </div>
 
 <script>
-  function filterRows(query) {
-    const q = query.trim().toLowerCase();
-    document.querySelectorAll('#patientBody tr.patient-row').forEach((row) => {
-      row.style.display = row.dataset.name.includes(q) ? '' : 'none';
-    });
+const SECRET = ${JSON.stringify(secret)};
+const TODAY = ${JSON.stringify(todayStr)};
+let currentTab = 'today';
+
+function api(path, opts) {
+  const url = new URL(path, window.location.origin);
+  if (!opts || opts.method === undefined || opts.method === 'GET') {
+    url.searchParams.set('secret', SECRET);
+    return fetch(url).then((r) => r.json());
   }
+  return fetch(url, {
+    method: opts.method,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...opts.body, secret: SECRET }),
+  }).then((r) => r.json());
+}
+
+function esc(s) { const d = document.createElement('div'); d.textContent = (s == null ? '' : String(s)); return d.innerHTML; }
+
+document.querySelectorAll('.tab-btn').forEach((btn) => {
+  btn.addEventListener('click', () => switchTab(btn.dataset.tab));
+});
+
+function switchTab(tab) {
+  currentTab = tab;
+  document.querySelectorAll('.tab-btn').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
+  const renderers = { today: renderToday, calendar: renderCalendar, patients: renderPatients, payments: renderPayments, capacity: renderCapacity, medicines: renderMedicines };
+  renderers[tab]();
+}
+
+// ---------- Today's Queue ----------
+async function renderToday(dateStr) {
+  dateStr = dateStr || TODAY;
+  const content = document.getElementById('content');
+  content.innerHTML = '<div class="card">Loading…</div>';
+  const data = await api('/api/bookings-range?start=' + dateStr + '&end=' + dateStr);
+  const s = data.summary;
+  const rows = data.bookings;
+  content.innerHTML = \`
+    <div class="card">
+      <div class="toolbar">
+        <label>Date: <input type="date" id="todayDate" value="\${dateStr}" onchange="renderToday(this.value)"></label>
+        <button class="primary" onclick="openWalkinModal('\${dateStr}')">+ Add Walk-in</button>
+        <a class="btn-link" href="/dashboard/export.csv?secret=\${encodeURIComponent(SECRET)}&start=\${dateStr}&end=\${dateStr}" target="_blank">⬇ Export CSV</a>
+        <input type="search" id="searchBox" placeholder="🔍 Search by name..." oninput="filterTodayRows(this.value)" style="margin-left:auto;">
+      </div>
+      <div class="stats">
+        <div class="stat-card"><div class="num">\${s.total}</div><div class="lbl">Total</div></div>
+        <div class="stat-card"><div class="num">\${s.newCount}</div><div class="lbl">New</div></div>
+        <div class="stat-card"><div class="num">\${s.followUpCount}</div><div class="lbl">Follow-up</div></div>
+        <div class="stat-card"><div class="num">\${s.paidCount}</div><div class="lbl">Paid</div></div>
+        <div class="stat-card"><div class="num">\${s.freeCount}</div><div class="lbl">Free</div></div>
+        <div class="stat-card"><div class="num">₹\${s.revenue}</div><div class="lbl">Revenue</div></div>
+      </div>
+      <table>
+        <thead><tr><th class="center">Token</th><th>Name</th><th class="center">Age</th><th class="center">Time</th><th>Reason</th><th class="center">Type</th><th class="center">Payment</th><th class="center">Case Paper</th></tr></thead>
+        <tbody id="todayBody">
+          \${rows.length ? rows.map((b) => \`
+            <tr class="patient-row" data-name="\${esc((b.Name||'').toLowerCase())}">
+              <td class="center" style="font-weight:700;color:#14532d;">\${esc(b['Token Number'])}</td>
+              <td style="font-weight:600;">\${esc(b.Name)}</td>
+              <td class="center">\${esc(b.Age)}</td>
+              <td class="center">\${esc(b.Slot)}</td>
+              <td>\${esc(b.Reason) || '-'}</td>
+              <td class="center"><span class="badge \${b['Visit Type']==='New'?'new':'followup'}">\${esc(b['Visit Type'])}</span></td>
+              <td class="center"><span class="paystatus \${b['Payment Status']==='Free'?'free':'paid'}">\${esc(b['Payment Status'])}</span></td>
+              <td class="center"><a class="btn-link" target="_blank" href="/case-paper?secret=\${encodeURIComponent(SECRET)}&phone=\${esc(b['Phone Number'])}&date=\${dateStr}&token=\${esc(b['Token Number'])}">📋 Open</a></td>
+            </tr>\`).join('') : '<tr><td colspan="8" class="empty">No bookings for this date yet.</td></tr>'}
+        </tbody>
+      </table>
+    </div>\`;
+}
+function filterTodayRows(q) {
+  q = q.trim().toLowerCase();
+  document.querySelectorAll('#todayBody tr.patient-row').forEach((row) => { row.style.display = row.dataset.name.includes(q) ? '' : 'none'; });
+}
+
+// ---------- Calendar (last 7 + next 7 days) ----------
+async function renderCalendar() {
+  const content = document.getElementById('content');
+  content.innerHTML = '<div class="card">Loading…</div>';
+  const start = shiftDate(TODAY, -6);
+  const end = shiftDate(TODAY, 7);
+  const data = await api('/api/bookings-range?start=' + start + '&end=' + end);
+  const byDate = {};
+  data.summary.byDate.forEach((d) => { byDate[d.date] = d; });
+  const days = [];
+  for (let i = -6; i <= 7; i++) days.push(shiftDate(TODAY, i));
+  const max = Math.max(1, ...days.map((d) => (byDate[d] ? byDate[d].total : 0)));
+
+  content.innerHTML = \`
+    <div class="card">
+      <h2 style="margin-top:0;font-size:15px;color:#14532d;">Bookings — last 7 & next 7 days</h2>
+      <div class="chart-wrap">
+        <div style="display:flex;gap:8px;align-items:flex-end;min-width:700px;height:140px;padding-top:10px;">
+          \${days.map((d) => {
+            const count = byDate[d] ? byDate[d].total : 0;
+            const h = Math.round((count / max) * 100);
+            const isToday = d === TODAY;
+            return \`<div style="flex:1;text-align:center;cursor:pointer;" onclick="switchTab('today'); setTimeout(()=>renderToday('\${d}'),0);" title="\${d}: \${count} bookings">
+              <div style="height:100px;display:flex;align-items:flex-end;justify-content:center;">
+                <div style="width:70%;background:\${isToday?'#14532d':'#8fbfa0'};border-radius:4px 4px 0 0;height:\${Math.max(h,3)}%;"></div>
+              </div>
+              <div style="font-size:10px;color:#7c8f85;margin-top:4px;">\${d.slice(5)}</div>
+              <div style="font-size:11px;font-weight:700;color:#14532d;">\${count}</div>
+            </div>\`;
+          }).join('')}
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <h2 style="margin-top:0;font-size:15px;color:#14532d;">Pick any date</h2>
+      <div class="toolbar">
+        <input type="date" id="calDate" value="\${TODAY}">
+        <button class="primary" onclick="switchTab('today'); setTimeout(()=>renderToday(document.getElementById('calDate').value),0);">Open that day's queue</button>
+      </div>
+    </div>\`;
+}
+function shiftDate(dateStr, days) {
+  const d = new Date(dateStr + 'T00:00:00');
+  d.setDate(d.getDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+// ---------- Patients ----------
+async function renderPatients(q) {
+  const content = document.getElementById('content');
+  content.innerHTML = '<div class="card">Loading…</div>';
+  const data = await api('/api/patients' + (q ? '?q=' + encodeURIComponent(q) : ''));
+  content.innerHTML = \`
+    <div class="card">
+      <div class="toolbar">
+        <input type="search" placeholder="🔍 Search by name, phone, or patient ID..." style="flex:1;" oninput="renderPatients(this.value)" value="\${esc(q||'')}">
+      </div>
+      <table>
+        <thead><tr><th>Name</th><th class="center">Age</th><th>Phone</th><th>Patient ID</th><th class="center">Last Visit</th><th class="center">History</th></tr></thead>
+        <tbody>
+          \${data.patients.length ? data.patients.map((p) => \`
+            <tr>
+              <td style="font-weight:600;">\${esc(p.name)}</td>
+              <td class="center">\${esc(p.age)}</td>
+              <td>\${esc(p.phone)}</td>
+              <td>\${esc(p.patientId)}</td>
+              <td class="center">\${esc(p.lastVisitDate) || '-'}</td>
+              <td class="center"><button class="secondary" onclick="openHistory('\${esc(p.phone)}','\${esc(p.name)}')">View</button></td>
+            </tr>\`).join('') : '<tr><td colspan="6" class="empty">No patients found.</td></tr>'}
+        </tbody>
+      </table>
+    </div>\`;
+}
+
+async function openHistory(phone, name) {
+  document.getElementById('historyTitle').textContent = name + "'s History";
+  document.getElementById('historyBody').innerHTML = 'Loading…';
+  document.getElementById('historyModal').classList.add('open');
+  const data = await api('/api/patient-history?phone=' + encodeURIComponent(phone));
+  const rows = data.bookings || [];
+  document.getElementById('historyBody').innerHTML = rows.length ? \`
+    <table><thead><tr><th>Date</th><th>Time</th><th class="center">Type</th><th class="center">Payment</th><th class="center">Open</th></tr></thead>
+    <tbody>\${rows.map((b) => \`<tr>
+      <td>\${esc(b.Date)}</td><td>\${esc(b.Slot)}</td>
+      <td class="center"><span class="badge \${b['Visit Type']==='New'?'new':'followup'}">\${esc(b['Visit Type'])}</span></td>
+      <td class="center"><span class="paystatus \${b['Payment Status']==='Free'?'free':'paid'}">\${esc(b['Payment Status'])}</span></td>
+      <td class="center"><a class="btn-link" target="_blank" href="/case-paper?secret=\${encodeURIComponent(SECRET)}&phone=\${encodeURIComponent(phone)}&date=\${b.Date}&token=\${esc(b['Token Number'])}">📋</a></td>
+    </tr>\`).join('')}</tbody></table>\` : '<p class="empty">No bookings on record.</p>';
+}
+
+// ---------- Payments / Revenue ----------
+async function renderPayments(start, end) {
+  start = start || shiftDate(TODAY, -29);
+  end = end || TODAY;
+  const content = document.getElementById('content');
+  content.innerHTML = '<div class="card">Loading…</div>';
+  const data = await api('/api/bookings-range?start=' + start + '&end=' + end);
+  const s = data.summary;
+  const max = Math.max(1, ...s.byDate.map((d) => d.revenue));
+  content.innerHTML = \`
+    <div class="card">
+      <div class="toolbar">
+        <label>From <input type="date" id="payStart" value="\${start}"></label>
+        <label>To <input type="date" id="payEnd" value="\${end}"></label>
+        <button class="primary" onclick="renderPayments(document.getElementById('payStart').value, document.getElementById('payEnd').value)">Load</button>
+        <a class="btn-link" href="/dashboard/export.csv?secret=\${encodeURIComponent(SECRET)}&start=\${start}&end=\${end}" target="_blank">⬇ Export CSV</a>
+      </div>
+      <div class="stats">
+        <div class="stat-card"><div class="num">₹\${s.revenue}</div><div class="lbl">Total Revenue</div></div>
+        <div class="stat-card"><div class="num">\${s.paidCount}</div><div class="lbl">Paid Visits</div></div>
+        <div class="stat-card"><div class="num">\${s.freeCount}</div><div class="lbl">Free Visits</div></div>
+        <div class="stat-card"><div class="num">\${s.total}</div><div class="lbl">Total Visits</div></div>
+      </div>
+      <div class="chart-wrap">
+        <div style="display:flex;gap:6px;align-items:flex-end;min-width:\${Math.max(700, s.byDate.length*36)}px;height:140px;padding-top:10px;">
+          \${s.byDate.map((d) => \`<div style="flex:1;text-align:center;" title="\${d.date}: ₹\${d.revenue}">
+            <div style="height:100px;display:flex;align-items:flex-end;justify-content:center;">
+              <div style="width:70%;background:#14532d;border-radius:4px 4px 0 0;height:\${Math.max(Math.round((d.revenue/max)*100),3)}%;"></div>
+            </div>
+            <div style="font-size:9.5px;color:#7c8f85;margin-top:4px;">\${d.date.slice(5)}</div>
+          </div>\`).join('')}
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <table>
+        <thead><tr><th>Date</th><th class="center">Total</th><th class="center">New</th><th class="center">Follow-up</th><th class="center">Revenue</th></tr></thead>
+        <tbody>\${s.byDate.length ? s.byDate.map((d) => \`<tr><td>\${d.date}</td><td class="center">\${d.total}</td><td class="center">\${d.new}</td><td class="center">\${d.followUp}</td><td class="center">₹\${d.revenue}</td></tr>\`).join('') : '<tr><td colspan="5" class="empty">No data in this range.</td></tr>'}</tbody>
+      </table>
+    </div>\`;
+}
+
+// ---------- Capacity ----------
+async function renderCapacity(dateStr) {
+  dateStr = dateStr || TODAY;
+  const content = document.getElementById('content');
+  content.innerHTML = '<div class="card">Loading…</div>';
+  const data = await api('/api/capacity?date=' + dateStr);
+  content.innerHTML = \`
+    <div class="card">
+      <div class="toolbar">
+        <label>Date: <input type="date" id="capDate" value="\${dateStr}" onchange="renderCapacity(this.value)"></label>
+        <a class="btn-link" href="/admin/generate-slots?secret=\${encodeURIComponent(SECRET)}" target="_blank">⚡ Generate upcoming slots</a>
+      </div>
+      <div id="capMsg"></div>
+      <table>
+        <thead><tr><th>Slot</th><th class="center">Booked</th><th class="center">Max Capacity</th><th class="center">Save</th></tr></thead>
+        <tbody>
+          \${data.slots.length ? data.slots.map((s) => \`
+            <tr>
+              <td>\${esc(s.slot)}</td>
+              <td class="center">\${s.booked}</td>
+              <td class="center"><input type="number" min="0" style="width:70px;text-align:center;" id="cap-\${s.rowNumber}" value="\${s.maxCapacity}"></td>
+              <td class="center"><button class="secondary" onclick="saveCapacity(\${s.rowNumber})">Save</button></td>
+            </tr>\`).join('') : '<tr><td colspan="4" class="empty">No slots generated for this date yet — click "Generate upcoming slots" above.</td></tr>'}
+        </tbody>
+      </table>
+    </div>\`;
+}
+async function saveCapacity(rowNumber) {
+  const val = document.getElementById('cap-' + rowNumber).value;
+  const res = await api('/api/capacity/update', { method: 'POST', body: { rowNumber, maxCapacity: val } });
+  document.getElementById('capMsg').innerHTML = res.ok ? '<div class="msg ok">Saved.</div>' : '<div class="msg err">' + esc(res.error||'Save failed') + '</div>';
+}
+
+// ---------- Medicines ----------
+async function renderMedicines() {
+  const content = document.getElementById('content');
+  content.innerHTML = '<div class="card">Loading…</div>';
+  const data = await api('/api/medicines');
+  content.innerHTML = \`
+    <div class="card">
+      <div class="toolbar"><input type="search" id="medSearch" placeholder="🔍 Search medicine..." oninput="filterMeds(this.value)"></div>
+      <table>
+        <thead><tr><th>Medicine</th><th class="center">Morning</th><th class="center">Evening</th><th class="center">Before Meal</th><th class="center">After Meal</th></tr></thead>
+        <tbody id="medBody">
+          \${data.medicines.length ? data.medicines.map((m) => \`
+            <tr class="med-row" data-name="\${esc(m.name.toLowerCase())}">
+              <td style="font-weight:600;">\${esc(m.name)}</td>
+              <td class="center">\${esc(m.morning)}</td>
+              <td class="center">\${esc(m.evening)}</td>
+              <td class="center">\${esc(m.beforeMeal)}</td>
+              <td class="center">\${esc(m.afterMeal)}</td>
+            </tr>\`).join('') : '<tr><td colspan="5" class="empty">No medicines in the database yet.</td></tr>'}
+        </tbody>
+      </table>
+    </div>\`;
+}
+function filterMeds(q) {
+  q = q.trim().toLowerCase();
+  document.querySelectorAll('#medBody tr.med-row').forEach((row) => { row.style.display = row.dataset.name.includes(q) ? '' : 'none'; });
+}
+
+// ---------- Walk-in modal ----------
+function openWalkinModal(dateStr) {
+  document.getElementById('walkinMsg').innerHTML = '';
+  document.getElementById('wName').value = '';
+  document.getElementById('wPhone').value = '';
+  document.getElementById('wAge').value = '';
+  document.getElementById('wReason').value = '';
+  document.getElementById('wDate').value = dateStr || TODAY;
+  document.getElementById('wPayment').value = 'Paid';
+  loadSlotsForWalkin(dateStr || TODAY);
+  document.getElementById('wDate').onchange = (e) => loadSlotsForWalkin(e.target.value);
+  document.getElementById('walkinModal').classList.add('open');
+}
+function closeWalkinModal() { document.getElementById('walkinModal').classList.remove('open'); }
+async function loadSlotsForWalkin(dateStr) {
+  const sel = document.getElementById('wSlot');
+  sel.innerHTML = '<option>Loading…</option>';
+  const data = await api('/api/capacity?date=' + dateStr);
+  const open = data.slots.filter((s) => s.booked < s.maxCapacity);
+  sel.innerHTML = open.length
+    ? open.map((s) => \`<option value="\${esc(s.slot)}">\${esc(s.slot)} (\${s.maxCapacity - s.booked} open)</option>\`).join('')
+    : '<option value="">No open slots this date</option>';
+}
+async function submitWalkin() {
+  const body = {
+    name: document.getElementById('wName').value.trim(),
+    phone: document.getElementById('wPhone').value.trim(),
+    age: document.getElementById('wAge').value.trim(),
+    reason: document.getElementById('wReason').value.trim(),
+    date: document.getElementById('wDate').value,
+    slot: document.getElementById('wSlot').value,
+    paymentStatus: document.getElementById('wPayment').value,
+  };
+  const res = await api('/api/walkin', { method: 'POST', body });
+  if (res.ok) {
+    document.getElementById('walkinMsg').innerHTML = '<div class="msg ok">Booked — Token #' + res.token + '</div>';
+    setTimeout(() => { closeWalkinModal(); renderToday(body.date); }, 900);
+  } else {
+    document.getElementById('walkinMsg').innerHTML = '<div class="msg err">' + esc(res.error || 'Failed') + '</div>';
+  }
+}
+
+switchTab('today');
 </script>
 </body>
 </html>`;
 }
 
 // Example: https://your-app.onrender.com/dashboard?secret=YOUR_SECRET
-// Optional &date=YYYY-MM-DD (defaults to today).
 app.get('/dashboard', async (req, res) => {
   if (req.query.secret !== TRIGGER_SECRET) {
     return res.sendStatus(401);
   }
   try {
     const settings = await sheets.getSettings();
-    const dateStr = req.query.date || istDateString(0);
-    const bookings = await sheets.getBookingsForDate(dateStr);
-
-    const html = buildDashboardHtml({
+    const html = buildDashboardAppHtml({
       clinicName: settings.clinicName || CLINIC_NAME_FALLBACK,
-      dateStr,
-      bookings,
       secret: TRIGGER_SECRET,
+      todayStr: istDateString(0),
     });
-
     res.set('Content-Type', 'text/html');
     res.send(html);
   } catch (err) {
