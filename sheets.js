@@ -117,59 +117,25 @@ async function getSettings() {
 // cache so the next getSettings() call picks up any change immediately.
 async function setSettingValue(key, value) {
   const sheets = await getSheetsClient();
-  console.log(`setSettingValue: writing to spreadsheetId=${SHEET_ID}`);
-
   const { rows } = await readTab('Settings');
 
-  // Debug: dump every key currently in column A, with char codes, so an
-  // invisible/whitespace character mismatch (e.g. from copy-pasting the
-  // template) shows up clearly in the logs instead of silently causing a
-  // duplicate row to be appended instead of the existing one being updated.
-  console.log(
-    'setSettingValue: existing keys in Settings!A ->',
-    rows.map((r, i) => {
-      const raw = r[0] || '';
-      return `[row${i + 2}] "${raw.trim()}" (len=${raw.trim().length}, codes=${[...raw.trim()]
-        .map((c) => c.charCodeAt(0))
-        .join(',')})`;
-    })
-  );
-  console.log(
-    `setSettingValue: looking for key "${key}" (len=${key.length}, codes=${[...key]
-      .map((c) => c.charCodeAt(0))
-      .join(',')})`
-  );
-
   const existingIndex = rows.findIndex((r) => (r[0] || '').trim() === key);
-
   if (existingIndex === -1) {
-    console.log(`setSettingValue: no existing "${key}" row found — appending new row`);
-    const appendRes = await sheets.spreadsheets.values.append({
+    await sheets.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
       range: 'Settings!A:B',
       valueInputOption: 'USER_ENTERED',
       insertDataOption: 'INSERT_ROWS',
       requestBody: { values: [[key, value]] },
     });
-    console.log('setSettingValue: append response range ->', appendRes.data.updates && appendRes.data.updates.updatedRange);
   } else {
     const sheetRowNumber = existingIndex + 2; // +1 header, +1 for 1-indexing
-    console.log(`setSettingValue: found "${key}" at sheet row ${sheetRowNumber} — updating Settings!B${sheetRowNumber}`);
-    const updateRes = await sheets.spreadsheets.values.update({
+    await sheets.spreadsheets.values.update({
       spreadsheetId: SHEET_ID,
       range: `Settings!B${sheetRowNumber}`,
       valueInputOption: 'USER_ENTERED',
       requestBody: { values: [[value]] },
     });
-    console.log('setSettingValue: update response ->', JSON.stringify(updateRes.data));
-
-    // Read the cell straight back so the log proves what's actually sitting
-    // in the Sheet right now, not just what the API claims it wrote.
-    const verify = await sheets.spreadsheets.values.get({
-      spreadsheetId: SHEET_ID,
-      range: `Settings!B${sheetRowNumber}`,
-    });
-    console.log(`setSettingValue: read-back of Settings!B${sheetRowNumber} ->`, JSON.stringify(verify.data.values));
   }
   settingsCache = null; // force a fresh read next time
 }
@@ -904,115 +870,79 @@ async function updatePatientProfileDetails(phone, details) {
   return true;
 }
 
-// ---------- Dashboard v2: hospital-management-style data helpers ----------
-// Everything below reads/writes the same four tabs (Patients, Bookings,
-// Capacity, Medicines) that already exist — no new tabs or schema changes,
-// just more ways to slice the same data for the staff dashboard.
+// ---------- Full dashboard support: Patients list + Live Queue (Phase 4) ----------
 
-// Every patient ever booked, for the Patients tab of the dashboard
-// (search-by-name/phone, see last visit at a glance).
+// All patients with computed visit stats — used by the Patients tab of the
+// dashboard. Cross-references Bookings to count total visits, since that's
+// more reliable than trusting a manually-editable counter.
 async function getAllPatients() {
-  let header, rows;
-  try {
-    ({ header, rows } = await readTab('Patients'));
-  } catch (err) {
-    console.error('getAllPatients: could not read "Patients" tab. Error:', err.message);
-    return [];
+  const patientsTab = await readTab('Patients');
+  const bookingsTab = await readTab('Bookings');
+  const bPhoneIdx = bookingsTab.header.indexOf('Phone Number');
+  const bDateIdx = bookingsTab.header.indexOf('Date');
+
+  const visitCounts = {};
+  const lastVisits = {};
+  if (bPhoneIdx !== -1) {
+    bookingsTab.rows.forEach((r) => {
+      const phone = stripQuote(r[bPhoneIdx]);
+      if (!phone) return;
+      visitCounts[phone] = (visitCounts[phone] || 0) + 1;
+      if (bDateIdx !== -1) {
+        const d = stripQuote(r[bDateIdx]).trim();
+        if (d && (!lastVisits[phone] || d > lastVisits[phone])) lastVisits[phone] = d;
+      }
+    });
   }
-  return rows.map((r) => {
-    const obj = rowToObject(header, r);
-    return {
-      phone: stripQuote(obj['Phone Number'] || ''),
-      name: obj.Name || '',
-      age: obj.Age || '',
-      lang: obj.Lang || '',
-      lastVisitDate: stripQuote(obj['Last Visit Date'] || ''),
-      patientId: obj['Patient ID'] || '',
-    };
-  });
+
+  return patientsTab.rows
+    .map((r) => {
+      const obj = rowToObject(patientsTab.header, r);
+      const phone = stripQuote(obj['Phone Number']);
+      return {
+        phone,
+        name: obj.Name,
+        age: obj.Age,
+        patientId: obj['Patient ID'] || '',
+        lastVisit: lastVisits[phone] || stripQuote(obj['Last Visit Date']) || '',
+        totalVisits: visitCounts[phone] || 0,
+      };
+    })
+    .filter((p) => p.name);
 }
 
-// Every booking a given phone number has ever made, newest first — powers
-// the "click a patient, see their full history" view.
-async function getBookingsForPhone(phone) {
+// Updates the "Queue Status" column for one booking (Waiting / Called /
+// In Progress / Completed / Skipped / No Show). Requires a "Queue Status"
+// column somewhere in the Bookings tab — falls back to column N if the
+// header text isn't found, so it still works even before that column is
+// formally added/labeled.
+async function updateBookingQueueStatus({ phone, date, token, status }) {
+  const sheets = await getSheetsClient();
   const { header, rows } = await readTab('Bookings');
   const phoneIdx = header.indexOf('Phone Number');
-  if (phoneIdx === -1) return [];
-  return rows
-    .filter((r) => stripQuote(r[phoneIdx]) === phone)
-    .map((r) => {
-      const obj = rowToObject(header, r);
-      obj.Date = stripQuote(obj.Date);
-      obj.Slot = stripQuote(obj.Slot);
-      obj['Phone Number'] = stripQuote(obj['Phone Number']);
-      return obj;
-    })
-    .sort((a, b) => (a.Date < b.Date ? 1 : a.Date > b.Date ? -1 : 0));
-}
-
-// Every booking between two YYYY-MM-DD dates (inclusive) — powers the
-// Calendar/week view and the Payments/Revenue summary. Plain string
-// comparison works fine since the format is always YYYY-MM-DD.
-async function getBookingsInRange(startStr, endStr) {
-  const { header, rows } = await readTab('Bookings');
   const dateIdx = header.indexOf('Date');
-  if (dateIdx === -1) return [];
-  return rows
-    .filter((r) => {
-      const d = stripQuote(r[dateIdx]).trim();
-      return d >= startStr && d <= endStr;
-    })
-    .map((r) => {
-      const obj = rowToObject(header, r);
-      obj.Date = stripQuote(obj.Date);
-      obj.Slot = stripQuote(obj.Slot);
-      obj['Phone Number'] = stripQuote(obj['Phone Number']);
-      return obj;
-    });
-}
+  const tokenIdx = header.indexOf('Token Number');
+  let statusIdx = header.indexOf('Queue Status');
+  if (phoneIdx === -1 || dateIdx === -1 || tokenIdx === -1) return false;
+  if (statusIdx === -1) statusIdx = 13; // column N fallback
 
-// Every slot configured for one date, WITH its live booked count and its
-// actual row number in the Capacity tab (so the dashboard can edit Max
-// Capacity in place without re-scanning the whole tab on every save).
-async function getCapacityForDate(dateStr) {
-  const { header, rows } = await readTab('Capacity');
-  const dateIdx = header.indexOf('Date');
-  const slotIdx = header.indexOf('Slot');
-  const capIdx = header.indexOf('Max Capacity');
-  if (dateIdx === -1 || slotIdx === -1 || capIdx === -1) return [];
+  const rowIndex = rows.findIndex(
+    (r) =>
+      stripQuote(r[phoneIdx]) === phone &&
+      stripQuote(r[dateIdx]).trim() === date.trim() &&
+      String(r[tokenIdx]).trim() === String(token).trim()
+  );
+  if (rowIndex === -1) return false;
 
-  const bookingsTab = await readTab('Bookings');
-  const bDateIdx = bookingsTab.header.indexOf('Date');
-  const bSlotIdx = bookingsTab.header.indexOf('Slot');
-
-  const result = [];
-  rows.forEach((r, i) => {
-    const rDate = stripQuote(r[dateIdx]).trim();
-    if (rDate !== dateStr.trim()) return;
-    const slot = stripQuote(r[slotIdx]).trim();
-    const maxCapacity = parseInt(r[capIdx], 10) || 0;
-    const booked =
-      bDateIdx === -1 || bSlotIdx === -1
-        ? 0
-        : bookingsTab.rows.filter(
-            (br) => stripQuote(br[bDateIdx]).trim() === rDate && stripQuote(br[bSlotIdx]).trim() === slot
-          ).length;
-    result.push({ rowNumber: i + 2, slot, maxCapacity, booked });
-  });
-  return result.sort((a, b) => (parseTimeToMinutes(a.slot) || 0) - (parseTimeToMinutes(b.slot) || 0));
-}
-
-// Edits Max Capacity for one already-existing Capacity row (found via the
-// rowNumber returned by getCapacityForDate) — e.g. staff closing a slot by
-// setting it to 0, or opening extra room for a busy day.
-async function updateCapacitySlotByRow(rowNumber, newMaxCapacity) {
-  const sheets = await getSheetsClient();
+  const rowNum = rowIndex + 2;
+  const colLetter = String.fromCharCode(65 + statusIdx);
   await sheets.spreadsheets.values.update({
     spreadsheetId: SHEET_ID,
-    range: `Capacity!C${rowNumber}`,
+    range: `Bookings!${colLetter}${rowNum}`,
     valueInputOption: 'USER_ENTERED',
-    requestBody: { values: [[newMaxCapacity]] },
+    requestBody: { values: [[status]] },
   });
+  return true;
 }
 
 module.exports = {
@@ -1034,6 +964,8 @@ module.exports = {
   getVisitType,
   getLastVisitDate,
   getBookingsForDate,
+  getAllPatients,
+  updateBookingQueueStatus,
   getMedicineDatabase,
   findBooking,
   getAvailableSlots,
@@ -1044,9 +976,4 @@ module.exports = {
   setPendingState,
   clearPendingState,
   findPendingByLastDigits,
-  getAllPatients,
-  getBookingsForPhone,
-  getBookingsInRange,
-  getCapacityForDate,
-  updateCapacitySlotByRow,
 };
