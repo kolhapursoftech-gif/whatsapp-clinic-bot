@@ -1,66 +1,223 @@
-# WhatsApp AI Receptionist — Setup
+# Clinic Bot — Upgrade Documentation
 
-## 1. Google Sheet
+Existing WhatsApp booking flow, tech stack (Node + Express + Render + Google
+Sheets + Google Drive + WhatsApp Cloud API) and files (`server.js`,
+`sheets.js`, `whatsapp.js`, `messages.js`) are all **preserved** — nothing
+was rewritten. Everything below is additive, wired in through `server.js`
+with the smallest possible edits (see Section 7).
 
-Create a new Google Sheet with **three tabs**, exact names and headers below (row 1 = headers).
+---
 
-**Capacity**
-| Date | Capacity |
+## 1. Updated Project File Structure
+
+```
+whatsapp-clinic-bot/
+├── server.js          (EXISTING — extended, not rewritten)
+├── sheets.js           (EXISTING — extended, not rewritten)
+├── whatsapp.js         (EXISTING — untouched)
+├── messages.js         (EXISTING — 3 new message keys added per language)
+├── package.json        (EXISTING — added "multer" dependency)
+│
+├── counters.js         (NEW) — all auto-numbering (Patient/Appointment/Case
+│                         Paper/Record/Prescription/Daily Token IDs)
+├── patients.js         (NEW) — patient domain logic (ID assignment, visit
+│                         recording, search, timeline)
+├── profile.js          (NEW) — secure patient self-service profile link
+│                         + page (GET/POST /patient-profile/:token)
+├── records.js          (NEW) — doctor's diagnosis/prescription persistence
+│                         + patient medical history for the case paper
+├── files.js            (NEW) — Google Drive upload/list/delete for patient
+│                         documents (lab reports, X-rays, etc.)
+├── queue.js            (NEW) — live token queue (check-in → call → consult
+│                         → complete/skip/no-show) + WhatsApp queue alert
+├── dashboard.js        (NEW) — Dashboard Home (stats), Patients list +
+│                         search, Patient detail (digital file / timeline)
+├── casepaper.js        (NEW) — upgraded case paper page (was inline in
+│                         server.js): Case Paper Number, patient history
+│                         panel, Save Diagnosis & Prescription
+└── ui.js               (NEW) — shared HTML shell / nav / design tokens used
+                          by dashboard.js, queue.js (keeps the new pages
+                          visually consistent with each other)
+```
+
+---
+
+## 2. Purpose of Each New File
+
+| File | Purpose |
 |---|---|
-| Default | 15 |
+| `counters.js` | Generates every auto-numbered ID (`PT-000001`, `APT-2026-000001`, `CP-2026-000001`, `REC-2026-000001`, `RX-2026-000001`, daily token `001/002/...`), reading/writing the `Counters` tab. Uses an in-process per-counter lock so two near-simultaneous bookings never get the same number (see the concurrency note inside the file). |
+| `patients.js` | "What does it mean for a patient to..." — assigning a Patient ID on first booking, bumping visit counts, searching, and building the combined booking+record timeline for the dashboard. |
+| `profile.js` | Generates the long random secure token sent to patients after booking, validates it (with expiry), and serves the self-service profile form (personal / emergency / medical info) — phone number and Patient ID never appear in the URL. |
+| `records.js` | Saves a doctor's diagnosis, notes, and prescription against a booking (`Records` tab), auto-generates the Case Paper Number the first time a case paper is opened, and assembles a patient's medical history for display. |
+| `files.js` | Uploads a file to Google Drive (via a service-account Drive client, separate scope from the Sheets client), stores metadata in the `Files` tab, and handles delete (both the Drive file and the metadata row). |
+| `queue.js` | The live "who's next" queue for the day. Creates a Queue row automatically when a booking is confirmed; exposes staff actions (Check In / Call / Start / Complete / Skip / No-Show); renders the live queue page; sends the "your turn is coming up" WhatsApp alert. |
+| `dashboard.js` | Three pages: `/dashboard/home` (today's stats + snapshots), `/patients` (searchable list), `/patients/:patientId` (complete digital file: personal info, medical info, timeline, files). |
+| `casepaper.js` | Everything the old inline `/case-paper` route did, PLUS: Case Paper Number badge, a patient-history panel (allergies/history/current medicines/last 5 diagnoses), and a "Save Diagnosis & Prescription" button (`POST /case-paper/save`) that actually persists into `Records` instead of only living in the browser tab. |
+| `ui.js` | One shared HTML page shell (nav bar + CSS variables) so `dashboard.js` and `queue.js` look like one product. `profile.js` and `casepaper.js` use their own standalone shells on purpose (they're patient-facing / print-facing pages, not staff nav pages). |
 
-Add a `Default` row so booking works even before the doctor sets specific dates. You can also add rows for a specific date (e.g. `2026-09-05`) to override the default for that day.
+---
 
-**Bookings** *(leave empty — the bot fills this in)*
-| Timestamp | Name | Age | Date | Token | Phone |
-|---|---|---|---|---|---|
+## 3. Google Sheets — Exact Tabs & Columns
 
-**Pending** *(leave empty — the bot fills this in)*
-| Phone | Step | Name | Age | UpdatedAt |
-|---|---|---|---|---|
+**Header row text must match EXACTLY (including spaces/capitalisation)** —
+every new function looks columns up by header name, not position, so you
+can add these columns in any order / any position in each tab.
 
-Copy the Sheet ID from its URL: `docs.google.com/spreadsheets/d/`**`THIS_PART`**`/edit`
+### Existing tabs — ADD these columns (append to the right of what's already there; don't reorder or delete existing columns)
 
-### Service account
-1. Google Cloud Console → new project → enable **Google Sheets API**
-2. Create a **Service Account** → create a key (JSON) → download it
-3. Open the JSON: copy `client_email` → `GOOGLE_SERVICE_ACCOUNT_EMAIL`, copy `private_key` → `GOOGLE_PRIVATE_KEY`
-4. **Share the Sheet** with that `client_email` address, giving it Editor access — this step is easy to miss and the #1 cause of a "permission denied" error
-
-## 2. Meta WhatsApp Cloud API
-1. developers.facebook.com → create an App (Business type) → add the **WhatsApp** product
-2. Note the **Phone Number ID** and generate a temporary (or permanent, via a system user) **Access Token**
-3. Under WhatsApp → Configuration, set the webhook URL to `https://YOUR-RENDER-URL/webhook` and the **Verify Token** to any string you choose — put the same string in `.env` as `WHATSAPP_VERIFY_TOKEN`
-4. Subscribe the webhook to the `messages` field
-
-## 3. Groq (optional but recommended)
-console.groq.com → sign up → create an API key. Free, no card required. Without a key, the bot still works — it just uses a generic fallback line instead of an AI-generated one when a patient goes off-script.
-
-## 4. Deploy to Render.com
-1. Push this folder to a GitHub repo
-2. Render.com → New → Web Service → connect the repo
-3. Build command: `npm install` · Start command: `npm start`
-4. Add every variable from `.env.example` under Render's **Environment** tab (don't upload `.env` itself)
-5. Deploy — Render gives you a public URL; use it as the WhatsApp webhook URL above
-
-## 5. Missed-call trigger
-The bot exposes a generic endpoint for this — wire up whatever missed-call/call-forwarding service you use to `POST` here when a call goes unanswered:
-
+**Bookings** — add:
 ```
-POST https://YOUR-RENDER-URL/trigger-missed-call?secret=YOUR_TRIGGER_SECRET
-Content-Type: application/json
+Booking ID | Patient ID | Case Paper Number | Fee | Booking Status | Queue Status | Updated At
+```
+(`Booking Status` values: Confirmed / Consulted. `Queue Status` mirrors the Queue tab's Status for quick filtering on the Bookings tab itself.)
 
-{ "phone": "91XXXXXXXXXX" }
+**Patients** — add:
+```
+Patient ID | Date of Birth | Gender | Address | City | Blood Group | Allergies |
+Medical History | Current Medicines | Emergency Contact Name |
+Emergency Contact Relation | Emergency Contact Phone | Profile Token |
+Profile Token Expiry | Profile Completed | Total Visits | Notes | Created At | Updated At
 ```
 
-That's all it needs — the trigger service doesn't need to know anything about WhatsApp or Sheets, just the caller's number.
+### Brand-new tabs — create these with EXACTLY these headers in row 1
 
-## 6. Test end-to-end
-- `curl -X POST ".../trigger-missed-call?secret=..." -H "Content-Type: application/json" -d '{"phone":"91XXXXXXXXXX"}'` — confirm the greeting arrives on that WhatsApp number
-- Reply with a name, then an age, then tap a date button — confirm the booking arrives in the **Bookings** tab and the doctor gets notified
-- Set `Capacity` to `1` for a test date, book it, then try booking again — confirm the "full" message and the automatic next-day offer
+**Counters**
+```
+Counter Type | Current Value | Updated At
+```
 
-## Notes
-- All text sent to patients is a simple Romanized Marathi/Hindi mix — edit the strings directly in `server.js` to match your clinic's preferred phrasing or language.
-- The booking flow (name → age → date buttons) is deterministic, not AI-generated, so it can't mis-parse a booking. Groq only handles the "patient said something unexpected" case.
-- State for an in-progress conversation lives in the **Pending** tab, not server memory, so it survives Render's free-tier spin-down/restarts.
+**Records**
+```
+Record ID | Patient ID | Booking ID | Case Paper Number | Date | Doctor Name |
+Reason | Diagnosis | Doctor Notes | Prescription ID | Prescription Items | Created At
+```
+> `Prescription Items` is one column beyond the original spec — it stores the
+> saved medicine rows (name/morning/evening/before-after-meal/days) as JSON
+> text, so a saved prescription can be redisplayed later. Without it, a
+> Prescription Number would exist with nothing behind it.
+
+**Files**
+```
+File ID | Patient ID | Record ID | File Name | File Type |
+Google Drive File ID | Google Drive URL | Uploaded By | Uploaded At
+```
+
+**Queue**
+```
+Date | Token Number | Booking ID | Patient ID | Status | Checked In At |
+Called At | Started At | Completed At
+```
+(`Status` values: Waiting / Checked-In / Called / In-Consultation / Completed / Skipped / No-Show)
+
+### Unchanged tabs
+`Settings`, `Capacity`, `Pending`, `Medicines` — no changes needed.
+
+---
+
+## 4. Required Environment Variables
+
+**Already existing (unchanged):**
+```
+GOOGLE_SHEET_ID
+GOOGLE_SERVICE_ACCOUNT_EMAIL
+GOOGLE_PRIVATE_KEY
+WHATSAPP_TOKEN
+WHATSAPP_PHONE_NUMBER_ID
+WHATSAPP_VERIFY_TOKEN
+WHATSAPP_API_VERSION        (optional, defaults to v20.0)
+TRIGGER_SECRET
+DOCTOR_WHATSAPP_NUMBER
+CLINIC_NAME
+APP_BASE_URL                (or RENDER_EXTERNAL_URL, auto-set on Render)
+PORT                        (Render sets this automatically)
+```
+
+**NEW — required for the new features:**
+```
+GOOGLE_DRIVE_FOLDER_ID      — a Drive folder shared with the service account
+                              (Editor access) where patient files are stored.
+PROFILE_LINK_VALID_DAYS     — optional, defaults to 30. How long a patient's
+                              profile-completion link stays valid.
+```
+
+> **Google Cloud setup note:** the same service account used for Sheets now
+> also needs the **Drive API enabled** in Google Cloud Console, and the
+> target Drive folder shared with the service account's email address
+> (Editor permission) — otherwise `files.js` uploads will fail.
+
+---
+
+## 5. Setup Instructions
+
+1. **Update the Google Sheet** — add the new columns/tabs exactly as listed
+   in Section 3. Do this BEFORE deploying the new code (old code keeps
+   working regardless; new code degrades gracefully if a column is missing,
+   but features depending on it — Patient ID, Queue, Case Paper Number,
+   etc. — won't do anything until the columns exist).
+2. **Enable the Drive API** for your Google Cloud project (same project as
+   the Sheets API), and share a Drive folder with your service account
+   email (Editor access). Copy that folder's ID into `GOOGLE_DRIVE_FOLDER_ID`.
+3. **Add the new environment variables** (Section 4) in Render's dashboard.
+4. **Deploy** — `npm install` will now also pull in `multer` (added to
+   `package.json`).
+5. Existing `/admin/generate-slots` and the WhatsApp webhook keep working
+   exactly as before — no re-setup needed there.
+6. New pages to bookmark for staff:
+   - `https://your-app.onrender.com/dashboard/home?secret=YOUR_SECRET`
+   - `https://your-app.onrender.com/patients?secret=YOUR_SECRET`
+   - `https://your-app.onrender.com/queue?secret=YOUR_SECRET`
+   - `/dashboard` (existing per-day view) now also links to all three above.
+
+---
+
+## 6. Testing Checklist
+
+**Regression (existing flow — do these FIRST, before trusting anything new):**
+- [ ] New patient sends "Hi" → language picker → name → age → reason → date → slot → payment/free flow → staff Confirm → booking-confirmed WhatsApp message arrives with the right token/date/time.
+- [ ] Returning patient sends "Hi" → recognized, skips straight to "same person / someone else?".
+- [ ] `/admin/generate-slots?secret=...` still generates the next 7 days without duplicates.
+- [ ] `/dashboard?secret=...&date=YYYY-MM-DD` still shows that day's bookings table exactly as before.
+- [ ] Staff `CONFIRM 1234` text command still works alongside the button flow.
+
+**New features:**
+- [ ] After a booking is confirmed, check the `Bookings` row has a `Booking ID`, `Patient ID`, and `Fee` filled in.
+- [ ] Same phone number booking twice reuses the same `Patient ID` (doesn't generate a new one).
+- [ ] Patient receives the secure profile link message; opening it shows a pre-filled form; saving shows "Tumchi mahiti yashasviritya update zali aahe."; a second visit to the same link shows the saved values.
+- [ ] An expired/garbage token on `/patient-profile/:token` returns the "link no longer valid" message, not a crash.
+- [ ] `/dashboard/home?secret=...` shows correct counts (Total/New/Follow-up/Waiting/Completed/Payment Pending/Paid Amount/Free/No-Show) matching today's actual bookings.
+- [ ] `/patients?secret=...&q=<name or phone or Patient ID>` finds the right patient.
+- [ ] `/patients/<Patient ID>?secret=...` shows personal info, medical info, a timeline with the booking(s), and an upload box.
+- [ ] Uploading a file from a patient's detail page appears in Google Drive AND in the `Files` tab; "Open" opens it; "Delete" removes both the Drive file and the row.
+- [ ] `/queue?secret=...` shows today's tokens; Check In → Call → Start Consultation → Complete moves a row through every stage; the "few tokens ahead" WhatsApp alert fires to the right patient when Call is pressed.
+- [ ] Opening `/case-paper?...` for a NEW-format booking shows a Case Paper Number badge and a history panel (if the patient has any); "Save Diagnosis & Prescription" persists and reappears if you reopen the same case paper.
+- [ ] Opening `/case-paper?...` for an OLD booking (made before this upgrade, no Booking ID) still opens correctly — just without the CP-number badge/save button data (since it has nothing to key off of).
+
+---
+
+## 7. Summary of What Changed in Existing Features
+
+- **`finalizeBooking()`** (in `server.js`) — same booking-confirmed message
+  and staff notification as before, PLUS: assigns/reuses a Patient ID,
+  generates a Booking ID, records the Fee amount, creates today's Queue
+  entry, bumps the patient's visit count, and sends the secure
+  profile-completion link. If `APP_BASE_URL` isn't set, the profile-link
+  step is skipped (booking still completes normally).
+- **`appendBooking()`** in `sheets.js` is UNTOUCHED and still exported —
+  `finalizeBooking` now calls a new function, `appendBookingRow()`, instead,
+  which writes by header name so it can populate the new columns on the
+  same row. If your Sheet's `Bookings` header doesn't have the new columns
+  yet, those fields are silently skipped and the original 10 columns are
+  written exactly as before — nothing breaks either way.
+- **`/case-paper`** — same URL/query-param shape, upgraded content (see
+  Section 2). The inline `buildCasePaperHtml()`/route in `server.js` was
+  removed and now lives in `casepaper.js`.
+- **`/dashboard`** (existing per-day bookings table) — untouched, with one
+  visual-only addition: three small nav links at the top ("🏠 Dashboard
+  Home", "🧑‍🤝‍🧑 Patients", "⏱️ Live Queue") pointing to the new pages.
+- **`messages.js`** — 3 new message keys added per language
+  (`profileLinkMessage`, `queueAlert`); all existing keys unchanged.
+- **`package.json`** — added `multer` as a dependency (file uploads).
+- Everything else (webhook verification, slot generation, staff CONFIRM/
+  HOLD/REJECT text commands, missed-call trigger) is byte-for-byte
+  unchanged.
