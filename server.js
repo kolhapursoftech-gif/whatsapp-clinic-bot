@@ -6,8 +6,20 @@ const whatsapp = require('./whatsapp');
 const sheets = require('./sheets');
 const { getMessages, LANGUAGE_BUTTONS, languagePrompt, SAME_PATIENT_BUTTONS } = require('./messages');
 
+// New feature modules (added on top of the existing booking flow — see
+// each file's header comment for what it owns).
+const counters = require('./counters');
+const patientsDomain = require('./patients');
+const profileModule = require('./profile');
+const queueModule = require('./queue');
+const filesModule = require('./files');
+const dashboardModule = require('./dashboard');
+const casepaperModule = require('./casepaper');
+
 const app = express();
 app.use(express.json());
+// Needed for the patient-profile page, which is a plain HTML <form method="POST">
+// (no JS framework) — those submit as application/x-www-form-urlencoded.
 app.use(express.urlencoded({ extended: true }));
 
 const CLINIC_NAME_FALLBACK = process.env.CLINIC_NAME || 'the clinic';
@@ -207,53 +219,62 @@ async function movePatientToPaymentStep(phone, state, settingsObj) {
 
 async function finalizeBooking(phone, name, age, reason, dateStr, slot, token, opts = {}) {
   const visitType = await sheets.getVisitType(phone);
+  const settings = await sheets.getSettings();
+  const feeAmount =
+    opts.paymentStatus === 'Free' ? 0 : parseInt(visitType === 'Follow-up' ? settings.followUpFee : settings.newPatientFee, 10) || 0;
 
-  // ID generation depends on the "Counters" tab existing/being set up
-  // correctly. Wrapped so that if it's missing or misconfigured, the
-  // booking still goes through with blank IDs instead of the whole
-  // confirmation silently failing.
-  let patientId = '';
-  let bookingId = '';
-  let casePaperNumber = '';
-  try {
-    patientId = await sheets.getOrCreatePatientId(phone);
-    bookingId = await sheets.generateAppointmentId();
-    casePaperNumber = await sheets.generateCasePaperNumber();
-  } catch (err) {
-    console.error('ID generation failed (check the "Counters" tab exists) — continuing without IDs:', err.message);
-  }
+  // --- New: Patient ID + Appointment (Booking) ID, generated once per booking ---
+  const patientId = await patientsDomain.ensurePatientId(phone);
+  const bookingId = await counters.nextAppointmentId();
 
-  await sheets.appendBooking({
-    name,
-    age,
-    reason,
-    date: dateStr,
-    slot,
-    token,
-    phone,
-    paymentStatus: opts.paymentStatus || 'Paid',
-    visitType,
-    bookingId,
-    casePaperNumber,
-    patientId,
+  // Writes ALL columns (old + new) on one row, by header name — see
+  // sheets.appendBookingRow(). If the live Sheet's Bookings tab hasn't had
+  // the new columns added yet, those extra fields are simply skipped (the
+  // original Timestamp..Visit Type columns are unaffected either way).
+  await sheets.appendBookingRow({
+    Timestamp: new Date().toISOString(),
+    'Phone Number': `'${phone}`,
+    Name: name,
+    Age: age,
+    Reason: reason || '',
+    Date: `'${dateStr}`,
+    Slot: `'${slot}`,
+    'Token Number': token,
+    'Payment Status': opts.paymentStatus || 'Paid',
+    'Visit Type': visitType,
+    'Booking ID': bookingId,
+    'Patient ID': patientId,
+    'Case Paper Number': '', // generated lazily the first time the case paper page is opened
+    Fee: feeAmount,
+    'Booking Status': 'Confirmed',
+    'Queue Status': 'Waiting',
+    'Updated At': new Date().toISOString(),
   });
-  await sheets.upsertPatientProfile(phone, { name, age, lang: opts.lang, lastVisitDate: dateStr, patientId });
+
+  await sheets.upsertPatientProfile(phone, { name, age, lang: opts.lang, lastVisitDate: dateStr });
+  await patientsDomain.recordVisit(phone, dateStr);
   await sheets.clearPendingState(phone);
+
+  // --- New: create today's live-queue entry for this token ---
+  try {
+    await queueModule.createQueueEntry({ dateStr, tokenNumber: token, bookingId, patientId });
+  } catch (err) {
+    console.error('createQueueEntry error (non-fatal):', err.message);
+  }
 
   const M = getMessages(opts.lang);
   await whatsapp.sendText(
     phone,
-    M.bookingConfirmed(opts.clinicName || CLINIC_NAME_FALLBACK, name, token, dateStr, slot, patientId, bookingId)
+    M.bookingConfirmed(opts.clinicName || CLINIC_NAME_FALLBACK, name, token, dateStr, slot)
   );
 
+  // --- New: secure patient-profile completion link ---
   if (APP_BASE_URL) {
     try {
-      const profileToken = await sheets.issueProfileToken(phone);
-      if (profileToken) {
-        await whatsapp.sendText(phone, M.profileLinkMessage(`${APP_BASE_URL}/patient-profile/${profileToken}`));
-      }
+      const profileLink = await profileModule.createProfileLink(phone, APP_BASE_URL);
+      await whatsapp.sendText(phone, M.profileLinkMessage(profileLink));
     } catch (err) {
-      console.error('Could not issue/send profile link:', err.message);
+      console.error('profile link error (non-fatal):', err.message);
     }
   }
 
@@ -262,7 +283,7 @@ async function finalizeBooking(phone, name, age, reason, dateStr, slot, token, o
     const casePaperLink = buildCasePaperLink({ phone, date: dateStr, token });
     await whatsapp.sendText(
       notifyNumber,
-      `Naveen Booking: ${name} (${age}) - Token #${token} - ${dateStr} ${slot} - ${visitType} (Payment: ${opts.paymentStatus || 'Paid'})\nKaran: ${reason || '-'}\n🆔 ${patientId} | ${bookingId} | ${casePaperNumber}\n\n📋 Case Paper: ${casePaperLink}`
+      `Naveen Booking: ${name} (${age}) - Token #${token} - ${dateStr} ${slot} - ${visitType} (Payment: ${opts.paymentStatus || 'Paid'})\nKaran: ${reason || '-'}\n\n📋 Case Paper: ${casePaperLink}`
     );
   }
 }
@@ -341,10 +362,11 @@ app.get('/admin/generate-slots', async (req, res) => {
 });
 
 // ---------- 2c. Case paper / prescription page for the doctor ----------
-// Staff/doctor get a link to this page (sent via WhatsApp when a booking is
-// confirmed). It shows the patient's details and a blank prescription table
-// the doctor can fill in (works fine on a phone/tablet touchscreen thanks to
-// contenteditable cells) and print directly from the browser.
+// MOVED to casepaper.js (upgraded: Case Paper Number, patient history panel,
+// Save Diagnosis & Prescription). Same URL shape as before
+// (/case-paper?secret=&phone=&date=&token=) so the WhatsApp link sent in
+// finalizeBooking() above keeps working unchanged. escapeHtml() below is
+// still used by buildDashboardHtml() further down, so it stays here.
 
 function escapeHtml(str) {
   return String(str || '')
@@ -354,273 +376,20 @@ function escapeHtml(str) {
     .replace(/"/g, '&quot;');
 }
 
-function buildCasePaperHtml({
-  clinicName,
-  clinicAddress,
-  clinicPhone,
-  doctorName,
-  name,
-  age,
-  reason,
-  date,
-  slot,
-  token,
-  visitType,
-  patientId,
-  casePaperNumber,
-  medicines = [],
-}) {
-  const rxRowTemplate = () => `
-      <tr>
-        <td class="num"></td>
-        <td><input type="text" class="med-input" list="medlist" oninput="handleMedInput(this)" onchange="handleMedInput(this)" autocomplete="off" placeholder="Type to search medicine..."></td>
-        <td contenteditable="true" class="center cell-morning"></td>
-        <td contenteditable="true" class="center cell-evening"></td>
-        <td contenteditable="true" class="center cell-before"></td>
-        <td contenteditable="true" class="center cell-after"></td>
-        <td contenteditable="true" class="center cell-days"></td>
-      </tr>`;
-  const rxRows = Array.from({ length: 4 }).map(rxRowTemplate).join('');
-
-  const medicineOptions = medicines.map((m) => `<option value="${escapeHtml(m.name)}">`).join('');
-  const medicineDbJson = JSON.stringify(
-    medicines.reduce((acc, m) => {
-      acc[m.name] = { morning: m.morning, evening: m.evening, beforeMeal: m.beforeMeal, afterMeal: m.afterMeal };
-      return acc;
-    }, {})
-  );
-
-  const contactLine = [clinicAddress, clinicPhone ? `📞 ${clinicPhone}` : '']
-    .filter(Boolean)
-    .join('  •  ');
-
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Case Paper - ${escapeHtml(name)}</title>
-<style>
-  * { box-sizing: border-box; }
-  body {
-    font-family: 'Segoe UI', Arial, Helvetica, sans-serif;
-    margin: 0; padding: 32px 16px; color: #1f2b26;
-    background: #eef2f0;
-  }
-  .sheet {
-    max-width: 840px; margin: 0 auto; background: #fff;
-    border-radius: 14px; box-shadow: 0 4px 24px rgba(15, 60, 45, 0.08);
-    padding: 40px 44px 32px;
-  }
-
-  .header { text-align: center; padding-bottom: 20px; margin-bottom: 26px; border-bottom: 3px solid #14532d; position: relative; }
-  .header::after { content: ''; position: absolute; left: 50%; bottom: -3px; transform: translateX(-50%); width: 70px; height: 3px; background: #d4a94f; }
-  .header h1 { margin: 0; color: #14532d; font-size: 27px; font-weight: 700; letter-spacing: 0.01em; }
-  .header .contact { margin: 8px 0 0; color: #6b7d74; font-size: 12.5px; }
-  .header .subtitle { margin: 12px 0 0; color: #b8862f; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.12em; }
-
-  .patient-info {
-    display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px 24px;
-    background: #f7faf8; border: 1px solid #e0e9e4; border-radius: 12px;
-    padding: 20px 24px; margin-bottom: 26px;
-  }
-  .patient-info .full { grid-column: 1 / -1; }
-  .patient-info span.label { color: #7c8f85; display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 3px; font-weight: 600; }
-  .patient-info span.value { font-weight: 600; color: #1f2b26; font-size: 14.5px; }
-  .badge { display: inline-block; padding: 3px 13px; border-radius: 20px; font-size: 11px; font-weight: 700; letter-spacing: 0.02em; }
-  .badge.new { background: #fdecd4; color: #a15c00; }
-  .badge.followup { background: #dcf1e6; color: #14532d; }
-
-  h2.rx { font-size: 15.5px; color: #14532d; margin: 0 0 14px; text-transform: uppercase; letter-spacing: 0.06em; display: flex; align-items: center; gap: 8px; }
-  h2.rx::before { content: '℞'; font-size: 22px; font-style: normal; }
-  table { width: 100%; border-collapse: separate; border-spacing: 0; border-radius: 10px; overflow: hidden; border: 1px solid #dbe5e0; }
-  th, td { padding: 11px 9px; font-size: 13px; border-bottom: 1px solid #e5ece8; }
-  th { background: #14532d; color: #fff; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; text-align: left; }
-  tbody tr:nth-child(even) { background: #fbfdfc; }
-  tbody tr:last-child td { border-bottom: none; }
-  td.num { text-align: center; color: #a7b5af; width: 28px; font-size: 12px; }
-  td.center { text-align: center; }
-  td[contenteditable="true"] { min-height: 26px; }
-  td[contenteditable="true"]:focus { outline: 2px solid #14532d; background: #f3faf6; }
-  .med-input { width: 100%; border: none; font-size: 13px; padding: 6px 4px; font-family: inherit; background: transparent; color: #1f2b26; }
-  .med-input:focus { outline: 2px solid #14532d; background: #f3faf6; }
-  .med-input::placeholder { color: #b6c2bc; }
-
-  .signature-row { display: flex; justify-content: space-between; align-items: flex-end; margin-top: 60px; padding: 0 6px; }
-  .signature-block { text-align: center; width: 220px; }
-  .signature-line { border-top: 1.5px solid #9aa8a1; margin-bottom: 8px; height: 36px; }
-  .signature-block .label { font-size: 12px; color: #6b7d74; font-weight: 600; }
-
-  .print-btn { display: block; margin: 32px auto 0; padding: 13px 32px; background: #14532d; color: #fff; border: none; border-radius: 9px; font-size: 15px; font-weight: 600; cursor: pointer; box-shadow: 0 2px 8px rgba(20,83,45,0.25); }
-  .print-btn:hover { background: #0f3f22; }
-  .add-row-btn { display: block; margin: 12px 0 0; padding: 8px 16px; background: #fff; color: #14532d; border: 1.5px dashed #9aa8a1; border-radius: 8px; font-size: 12.5px; font-weight: 600; cursor: pointer; }
-  .add-row-btn:hover { border-color: #14532d; }
-
-  @media print {
-    .no-print { display: none !important; }
-    body { padding: 0; background: #fff; }
-    .sheet { box-shadow: none; border-radius: 0; padding: 0; max-width: 100%; }
-  }
-</style>
-</head>
-<body>
-<div class="sheet">
-
-  <div class="header">
-    <h1>${escapeHtml(clinicName)}</h1>
-    ${contactLine ? `<p class="contact">${escapeHtml(contactLine)}</p>` : ''}
-    <p class="subtitle">Case Paper &amp; Prescription</p>
-    ${casePaperNumber || patientId ? `<p class="contact">${[casePaperNumber, patientId ? `Patient ID: ${patientId}` : ''].filter(Boolean).map(escapeHtml).join('  •  ')}</p>` : ''}
-  </div>
-
-  <div class="patient-info">
-    <div><span class="label">Patient Name</span><span class="value">${escapeHtml(name)}</span></div>
-    <div><span class="label">Age</span><span class="value">${escapeHtml(age)}</span></div>
-    <div><span class="label">Token No.</span><span class="value">${escapeHtml(token)}</span></div>
-    <div><span class="label">Date</span><span class="value">${escapeHtml(date)}</span></div>
-    <div><span class="label">Time</span><span class="value">${escapeHtml(slot)}</span></div>
-    <div><span class="label">Visit Type</span>
-      <span class="badge ${visitType === 'New' ? 'new' : 'followup'}">${escapeHtml(visitType)}</span>
-    </div>
-    <div class="full"><span class="label">Reason for Visit</span><span class="value">${escapeHtml(reason) || '-'}</span></div>
-  </div>
-
-  <datalist id="medlist">${medicineOptions}</datalist>
-  <script>
-    const MEDICINE_DB = ${medicineDbJson};
-    function tickIfSet(value) {
-      return value && String(value).trim() ? '✓' : '';
-    }
-    function handleMedInput(input) {
-      const med = MEDICINE_DB[input.value];
-      if (!med) return; // not an exact match yet — wait for a real selection
-      const row = input.closest('tr');
-      row.querySelector('.cell-morning').textContent = tickIfSet(med.morning);
-      row.querySelector('.cell-evening').textContent = tickIfSet(med.evening);
-      row.querySelector('.cell-before').textContent = tickIfSet(med.beforeMeal);
-      row.querySelector('.cell-after').textContent = tickIfSet(med.afterMeal);
-      // "Days" is left untouched — doctor fills that in manually per patient.
-    }
-
-    let rxRowCount = ${4};
-    function addRxRow() {
-      rxRowCount++;
-      const tbody = document.getElementById('rxBody');
-      const tr = document.createElement('tr');
-      tr.innerHTML = \`
-        <td class="num"></td>
-        <td><input type="text" class="med-input" list="medlist" oninput="handleMedInput(this)" onchange="handleMedInput(this)" autocomplete="off" placeholder="Type to search medicine..."></td>
-        <td contenteditable="true" class="center cell-morning"></td>
-        <td contenteditable="true" class="center cell-evening"></td>
-        <td contenteditable="true" class="center cell-before"></td>
-        <td contenteditable="true" class="center cell-after"></td>
-        <td contenteditable="true" class="center cell-days"></td>
-      \`;
-      tbody.appendChild(tr);
-    }
-  </script>
-
-  <h2 class="rx">Prescription</h2>
-  <table>
-    <thead>
-      <tr>
-        <th>#</th>
-        <th>Medicine Name</th>
-        <th>Morning</th>
-        <th>Evening</th>
-        <th>Before Meal</th>
-        <th>After Meal</th>
-        <th>Days</th>
-      </tr>
-    </thead>
-    <tbody id="rxBody">
-      ${rxRows}
-    </tbody>
-  </table>
-
-  <button class="add-row-btn no-print" onclick="addRxRow()">+ Add Medicine Row</button>
-
-  <div class="signature-row">
-    <div class="signature-block">
-      <div class="signature-line"></div>
-      <div class="label">Date</div>
-    </div>
-    <div class="signature-block">
-      <div class="signature-line"></div>
-      <div class="label">${doctorName ? escapeHtml(doctorName) : "Doctor's Signature"}</div>
-    </div>
-  </div>
-
-  <button class="print-btn no-print" onclick="window.print()">🖨️ Print Case Paper</button>
-
-</div>
-</body>
-</html>`;
-}
-
-// Example: https://your-app.onrender.com/case-paper?secret=YOUR_SECRET&phone=91xxxxxxxxxx&date=2026-09-05&token=3
-app.get('/case-paper', async (req, res) => {
-  if (req.query.secret !== TRIGGER_SECRET) {
-    return res.sendStatus(401);
-  }
-  const { phone, date, token } = req.query;
-  if (!phone || !date || !token) {
-    return res.status(400).send('phone, date and token query params are required.');
-  }
-
-  try {
-    const settings = await sheets.getSettings();
-    const booking = await sheets.findBooking({ phone: String(phone), date: String(date), token: String(token) });
-    if (!booking) {
-      return res.status(404).send('No matching booking found. Double-check the phone, date and token in the link.');
-    }
-    const medicines = await sheets.getMedicineDatabase();
-
-    const html = buildCasePaperHtml({
-      clinicName: settings.clinicName || CLINIC_NAME_FALLBACK,
-      clinicAddress: settings.clinicAddress,
-      clinicPhone: settings.clinicPhone,
-      doctorName: settings.doctorName,
-      name: booking.Name,
-      age: booking.Age,
-      reason: booking.Reason,
-      date: booking.Date,
-      slot: booking.Slot,
-      token: booking['Token Number'],
-      visitType: booking['Visit Type'],
-      patientId: booking['Patient ID'],
-      casePaperNumber: booking['Case Paper Number'],
-      medicines,
-    });
-
-    res.set('Content-Type', 'text/html');
-    res.send(html);
-  } catch (err) {
-    console.error('case-paper error:', err.message);
-    res.status(500).send('Error loading case paper: ' + err.message);
-  }
-});
 
 // ---------- 2d. Staff/doctor dashboard — browse any day's patients from a PC ----------
 // Unlike the one-off case-paper link sent via WhatsApp at booking time, this
 // page can be opened anytime (bookmark it) and lets staff pick a date and
 // jump straight into any patient's case paper.
 
-function buildDashboardHtml({ clinicName, dateStr, bookings, patients, secret }) {
+function buildDashboardHtml({ clinicName, dateStr, bookings, secret }) {
   const total = bookings.length;
   const newCount = bookings.filter((b) => b['Visit Type'] === 'New').length;
   const followUpCount = bookings.filter((b) => b['Visit Type'] === 'Follow-up').length;
   const paidCount = bookings.filter((b) => b['Payment Status'] === 'Paid').length;
   const freeCount = bookings.filter((b) => b['Payment Status'] === 'Free').length;
 
-  const QUEUE_STATES = ['Waiting', 'Called', 'In Progress', 'Completed', 'Skipped', 'No Show'];
-  const NEXT_ACTION = {
-    Waiting: { next: 'Called', label: '📢 Call' },
-    Called: { next: 'In Progress', label: '▶️ Start' },
-    'In Progress': { next: 'Completed', label: '✅ Complete' },
-  };
-
-  const appointmentRows = bookings.length
+  const rowsHtml = bookings.length
     ? bookings
         .map((b) => {
           const phone = String(b['Phone Number'] || '').replace(/^'/, '');
@@ -650,52 +419,6 @@ function buildDashboardHtml({ clinicName, dateStr, bookings, patients, secret })
         .join('')
     : `<tr><td colspan="8" class="empty">No bookings for this date yet.</td></tr>`;
 
-  const patientRows = patients.length
-    ? patients
-        .slice()
-        .sort((a, b) => (b.lastVisit || '').localeCompare(a.lastVisit || ''))
-        .map(
-          (p) => `
-          <tr class="pt-row" data-name="${escapeHtml((p.name || '').toLowerCase())}">
-            <td class="token-cell">${escapeHtml(p.patientId) || '-'}</td>
-            <td class="name-cell">${escapeHtml(p.name)}</td>
-            <td class="center">${escapeHtml(p.age)}</td>
-            <td class="center">...${escapeHtml(String(p.phone).slice(-4))}</td>
-            <td class="center">${p.totalVisits}</td>
-            <td class="center">${escapeHtml(p.lastVisit) || '-'}</td>
-          </tr>`
-        )
-        .join('')
-    : `<tr><td colspan="6" class="empty">No patients on record yet.</td></tr>`;
-
-  const queueSorted = bookings.slice().sort((a, b) => (parseInt(a['Token Number'], 10) || 0) - (parseInt(b['Token Number'], 10) || 0));
-  const nowServing = queueSorted.find((b) => (b['Queue Status'] || 'Waiting') === 'In Progress' || (b['Queue Status'] || 'Waiting') === 'Called');
-  const queueRows = queueSorted.length
-    ? queueSorted
-        .map((b) => {
-          const status = b['Queue Status'] || 'Waiting';
-          const action = NEXT_ACTION[status];
-          const phone = String(b['Phone Number'] || '').replace(/^'/, '');
-          const bookingDate = String(b['Date'] || '').replace(/^'/, '');
-          const tokenVal = b['Token Number'];
-          const isDone = status === 'Completed' || status === 'Skipped' || status === 'No Show';
-          return `
-          <div class="queue-card ${isDone ? 'done' : ''}">
-            <div class="queue-token">#${escapeHtml(tokenVal)}</div>
-            <div class="queue-info">
-              <div class="queue-name">${escapeHtml(b.Name)}</div>
-              <div class="queue-meta">${escapeHtml(b.Reason) || '-'} &nbsp;•&nbsp; ${escapeHtml(String(b.Slot || '').replace(/^'/, ''))}</div>
-            </div>
-            <span class="qstatus qstatus-${status.replace(/\s/g, '')}">${escapeHtml(status)}</span>
-            <div class="queue-actions">
-              ${action ? `<button class="qbtn" onclick="updateQueue('${escapeHtml(phone)}','${escapeHtml(bookingDate)}','${escapeHtml(tokenVal)}','${action.next}')">${action.label}</button>` : ''}
-              ${!isDone ? `<button class="qbtn skip" onclick="updateQueue('${escapeHtml(phone)}','${escapeHtml(bookingDate)}','${escapeHtml(tokenVal)}','Skipped')">⏭ Skip</button>` : ''}
-            </div>
-          </div>`;
-        })
-        .join('')
-    : `<p class="empty">No queue for this date yet.</p>`;
-
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -704,24 +427,21 @@ function buildDashboardHtml({ clinicName, dateStr, bookings, patients, secret })
 <title>Dashboard - ${escapeHtml(clinicName)}</title>
 <style>
   * { box-sizing: border-box; }
-  body { font-family: 'Segoe UI', Arial, Helvetica, sans-serif; margin: 0; background: #eef2f0; color: #1f2b26; }
-  .app { display: flex; min-height: 100vh; }
+  body {
+    font-family: 'Segoe UI', Arial, Helvetica, sans-serif;
+    margin: 0; padding: 32px 16px; color: #1f2b26; background: #eef2f0;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; }
 
-  .sidebar { width: 220px; background: #14532d; color: #fff; padding: 24px 0; flex-shrink: 0; }
-  .sidebar h2 { font-size: 15px; padding: 0 20px 18px; margin: 0; border-bottom: 1px solid rgba(255,255,255,0.15); }
-  .navitem { display: flex; align-items: center; gap: 10px; padding: 12px 20px; cursor: pointer; font-size: 13.5px; font-weight: 600; opacity: 0.8; }
-  .navitem:hover { background: rgba(255,255,255,0.08); opacity: 1; }
-  .navitem.active { background: rgba(255,255,255,0.14); opacity: 1; border-left: 3px solid #d4a94f; }
-
-  .main { flex: 1; padding: 28px 30px; max-width: 1150px; }
-  .section { display: none; }
-  .section.active { display: block; }
-
-  .topbar { display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 20px; flex-wrap: wrap; gap: 12px; }
-  .topbar h1 { color: #14532d; font-size: 21px; margin: 0 0 4px; font-weight: 700; }
+  .topbar { display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 22px; flex-wrap: wrap; gap: 12px; }
+  .topbar h1 { color: #14532d; font-size: 23px; margin: 0 0 4px; font-weight: 700; }
   .topbar .sub { color: #6b7d74; font-size: 13px; margin: 0; }
 
-  .toolbar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 18px; background: #fff; padding: 12px 16px; border-radius: 12px; border: 1px solid #e0e9e4; box-shadow: 0 2px 10px rgba(15,60,45,0.04); }
+  .toolbar {
+    display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+    margin-bottom: 20px; background: #fff; padding: 14px 18px; border-radius: 12px;
+    border: 1px solid #e0e9e4; box-shadow: 0 2px 10px rgba(15,60,45,0.04);
+  }
   .toolbar form { display: flex; gap: 10px; align-items: center; }
   .toolbar input[type="date"] { padding: 7px 10px; border: 1px solid #cdd9d3; border-radius: 7px; font-size: 13.5px; }
   .toolbar button[type="submit"] { padding: 8px 18px; background: #14532d; color: #fff; border: none; border-radius: 7px; cursor: pointer; font-size: 13.5px; font-weight: 600; }
@@ -731,11 +451,6 @@ function buildDashboardHtml({ clinicName, dateStr, bookings, patients, secret })
   .stat-card { background: #fff; border: 1px solid #e0e9e4; border-radius: 12px; padding: 14px 16px; box-shadow: 0 2px 10px rgba(15,60,45,0.04); }
   .stat-card .num { font-size: 22px; font-weight: 700; color: #14532d; }
   .stat-card .lbl { font-size: 11px; color: #7c8f85; text-transform: uppercase; letter-spacing: 0.04em; margin-top: 2px; font-weight: 600; }
-
-  .now-serving { background: linear-gradient(135deg,#14532d,#1a6b3a); color: #fff; border-radius: 14px; padding: 20px 24px; margin-bottom: 20px; display: flex; align-items: center; gap: 18px; }
-  .now-serving .big-token { font-size: 34px; font-weight: 800; }
-  .now-serving .ns-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; opacity: 0.8; }
-  .now-serving .ns-name { font-size: 15px; font-weight: 600; }
 
   table { width: 100%; border-collapse: separate; border-spacing: 0; background: #fff; border-radius: 12px; overflow: hidden; border: 1px solid #e0e9e4; box-shadow: 0 2px 10px rgba(15,60,45,0.04); }
   th, td { border-bottom: 1px solid #eef2ef; padding: 11px 10px; font-size: 13.5px; text-align: left; }
@@ -755,120 +470,73 @@ function buildDashboardHtml({ clinicName, dateStr, bookings, patients, secret })
   .open-btn { display: inline-block; padding: 6px 14px; background: #14532d; color: #fff !important; border-radius: 7px; text-decoration: none; font-size: 12.5px; font-weight: 600; }
   .open-btn:hover { background: #0f3f22; }
   .empty { text-align: center; color: #9aa8a1; padding: 30px; }
-
-  .queue-card { display: flex; align-items: center; gap: 16px; background: #fff; border: 1px solid #e0e9e4; border-radius: 12px; padding: 14px 18px; margin-bottom: 10px; box-shadow: 0 2px 10px rgba(15,60,45,0.04); }
-  .queue-card.done { opacity: 0.55; }
-  .queue-token { font-size: 20px; font-weight: 800; color: #14532d; width: 50px; }
-  .queue-info { flex: 1; }
-  .queue-name { font-weight: 700; font-size: 14.5px; }
-  .queue-meta { font-size: 12px; color: #7c8f85; margin-top: 2px; }
-  .qstatus { font-size: 11px; font-weight: 700; padding: 4px 12px; border-radius: 14px; background: #eef2ef; color: #556059; white-space: nowrap; }
-  .qstatus-Waiting { background: #eef2ef; color: #556059; }
-  .qstatus-Called { background: #fdecd4; color: #a15c00; }
-  .qstatus-InProgress { background: #d6eaf8; color: #14532d; }
-  .qstatus-Completed { background: #dcf1e6; color: #14532d; }
-  .qstatus-Skipped, .qstatus-NoShow { background: #fadbd8; color: #922b21; }
-  .queue-actions { display: flex; gap: 6px; }
-  .qbtn { padding: 7px 12px; background: #14532d; color: #fff; border: none; border-radius: 7px; font-size: 12px; font-weight: 600; cursor: pointer; }
-  .qbtn.skip { background: #fff; color: #922b21; border: 1px solid #f1b7b0; }
 </style>
 </head>
 <body>
-<div class="app">
+<div class="wrap">
 
-  <div class="sidebar">
-    <h2>${escapeHtml(clinicName)}</h2>
-    <div class="navitem active" data-section="overview" onclick="showSection('overview')">🏠 Overview</div>
-    <div class="navitem" data-section="appointments" onclick="showSection('appointments')">📅 Appointments</div>
-    <div class="navitem" data-section="patients" onclick="showSection('patients')">🧑‍🤝‍🧑 Patients</div>
-    <div class="navitem" data-section="queue" onclick="showSection('queue')">⏱️ Live Queue</div>
+  <div class="topbar">
+    <div>
+      <h1>${escapeHtml(clinicName)} — Patient Dashboard</h1>
+      <p class="sub">Bookings for ${escapeHtml(dateStr)}. Bookmark this page for quick access anytime.</p>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;">
+      <a href="/dashboard/home?secret=${encodeURIComponent(secret)}" style="font-size:12.5px;font-weight:600;color:#14532d;text-decoration:none;padding:7px 14px;border:1.5px solid #14532d;border-radius:7px;">🏠 Dashboard Home</a>
+      <a href="/patients?secret=${encodeURIComponent(secret)}" style="font-size:12.5px;font-weight:600;color:#14532d;text-decoration:none;padding:7px 14px;border:1.5px solid #14532d;border-radius:7px;">🧑‍🤝‍🧑 Patients</a>
+      <a href="/queue?secret=${encodeURIComponent(secret)}" style="font-size:12.5px;font-weight:600;color:#14532d;text-decoration:none;padding:7px 14px;border:1.5px solid #14532d;border-radius:7px;">⏱️ Live Queue</a>
+    </div>
   </div>
 
-  <div class="main">
-
-    <div id="section-overview" class="section active">
-      <div class="topbar"><div><h1>Overview</h1><p class="sub">Snapshot for ${escapeHtml(dateStr)}</p></div></div>
-      <div class="stats">
-        <div class="stat-card"><div class="num">${total}</div><div class="lbl">Total Today</div></div>
-        <div class="stat-card"><div class="num">${newCount}</div><div class="lbl">New</div></div>
-        <div class="stat-card"><div class="num">${followUpCount}</div><div class="lbl">Follow-up</div></div>
-        <div class="stat-card"><div class="num">${paidCount}</div><div class="lbl">Paid</div></div>
-        <div class="stat-card"><div class="num">${freeCount}</div><div class="lbl">Free</div></div>
-      </div>
-      ${nowServing ? `
-      <div class="now-serving">
-        <div><div class="ns-label">Now Serving</div><div class="big-token">#${escapeHtml(nowServing['Token Number'])}</div></div>
-        <div><div class="ns-label">Patient</div><div class="ns-name">${escapeHtml(nowServing.Name)}</div></div>
-      </div>` : ''}
-      <p class="sub">Use the sidebar to view all appointments, browse patients, or run the live queue.</p>
-    </div>
-
-    <div id="section-appointments" class="section">
-      <div class="topbar"><div><h1>Appointments</h1><p class="sub">Bookings for ${escapeHtml(dateStr)}</p></div></div>
-      <div class="toolbar">
-        <form method="get">
-          <input type="hidden" name="secret" value="${escapeHtml(secret)}">
-          <label>Date: <input type="date" name="date" value="${escapeHtml(dateStr)}"></label>
-          <button type="submit">Load</button>
-        </form>
-        <input type="search" placeholder="🔍 Search by patient name..." oninput="filterRows(this.value, '.patient-row')">
-      </div>
-      <table>
-        <thead><tr><th class="center">Token</th><th>Name</th><th class="center">Age</th><th class="center">Time</th><th>Reason</th><th class="center">Visit Type</th><th class="center">Payment</th><th class="center">Case Paper</th></tr></thead>
-        <tbody>${appointmentRows}</tbody>
-      </table>
-    </div>
-
-    <div id="section-patients" class="section">
-      <div class="topbar"><div><h1>Patients</h1><p class="sub">Everyone who has ever booked, ${patients.length} total</p></div></div>
-      <div class="toolbar">
-        <input type="search" placeholder="🔍 Search by patient name..." oninput="filterRows(this.value, '.pt-row')">
-      </div>
-      <table>
-        <thead><tr><th>Patient ID</th><th>Name</th><th class="center">Age</th><th class="center">Phone</th><th class="center">Total Visits</th><th class="center">Last Visit</th></tr></thead>
-        <tbody>${patientRows}</tbody>
-      </table>
-    </div>
-
-    <div id="section-queue" class="section">
-      <div class="topbar"><div><h1>Live Queue</h1><p class="sub">${escapeHtml(dateStr)} — tap a button to move a patient forward</p></div></div>
-      ${queueRows}
-    </div>
-
+  <div class="stats">
+    <div class="stat-card"><div class="num">${total}</div><div class="lbl">Total</div></div>
+    <div class="stat-card"><div class="num">${newCount}</div><div class="lbl">New</div></div>
+    <div class="stat-card"><div class="num">${followUpCount}</div><div class="lbl">Follow-up</div></div>
+    <div class="stat-card"><div class="num">${paidCount}</div><div class="lbl">Paid</div></div>
+    <div class="stat-card"><div class="num">${freeCount}</div><div class="lbl">Free</div></div>
   </div>
+
+  <div class="toolbar">
+    <form method="get">
+      <input type="hidden" name="secret" value="${escapeHtml(secret)}">
+      <label>Date: <input type="date" name="date" value="${escapeHtml(dateStr)}"></label>
+      <button type="submit">Load</button>
+    </form>
+    <input type="search" id="searchBox" placeholder="🔍 Search by patient name..." oninput="filterRows(this.value)">
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th class="center">Token</th>
+        <th>Name</th>
+        <th class="center">Age</th>
+        <th class="center">Time</th>
+        <th>Reason</th>
+        <th class="center">Visit Type</th>
+        <th class="center">Payment</th>
+        <th class="center">Case Paper</th>
+      </tr>
+    </thead>
+    <tbody id="patientBody">
+      ${rowsHtml}
+    </tbody>
+  </table>
 </div>
 
 <script>
-  function showSection(name) {
-    document.querySelectorAll('.section').forEach((s) => s.classList.remove('active'));
-    document.querySelectorAll('.navitem').forEach((n) => n.classList.remove('active'));
-    document.getElementById('section-' + name).classList.add('active');
-    document.querySelector('.navitem[data-section="' + name + '"]').classList.add('active');
-  }
-  function filterRows(query, selector) {
+  function filterRows(query) {
     const q = query.trim().toLowerCase();
-    document.querySelectorAll(selector).forEach((row) => {
+    document.querySelectorAll('#patientBody tr.patient-row').forEach((row) => {
       row.style.display = row.dataset.name.includes(q) ? '' : 'none';
     });
-  }
-  async function updateQueue(phone, date, token, status) {
-    try {
-      const res = await fetch('/api/queue/update', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ secret: '${escapeHtml(secret)}', phone, date, token, status }),
-      });
-      if (!res.ok) throw new Error('Update failed');
-      location.reload();
-    } catch (err) {
-      alert('Could not update queue status. Please try again.');
-    }
   }
 </script>
 </body>
 </html>`;
 }
 
+// Example: https://your-app.onrender.com/dashboard?secret=YOUR_SECRET
+// Optional &date=YYYY-MM-DD (defaults to today).
 app.get('/dashboard', async (req, res) => {
   if (req.query.secret !== TRIGGER_SECRET) {
     return res.sendStatus(401);
@@ -877,13 +545,11 @@ app.get('/dashboard', async (req, res) => {
     const settings = await sheets.getSettings();
     const dateStr = req.query.date || istDateString(0);
     const bookings = await sheets.getBookingsForDate(dateStr);
-    const patients = await sheets.getAllPatients();
 
     const html = buildDashboardHtml({
       clinicName: settings.clinicName || CLINIC_NAME_FALLBACK,
       dateStr,
       bookings,
-      patients,
       secret: TRIGGER_SECRET,
     });
 
@@ -895,156 +561,15 @@ app.get('/dashboard', async (req, res) => {
   }
 });
 
-app.post('/api/queue/update', async (req, res) => {
-  try {
-    const { secret, phone, date, token, status } = req.body || {};
-    if (secret !== TRIGGER_SECRET) return res.sendStatus(401);
-    if (!phone || !date || !token || !status) return res.status(400).json({ error: 'phone, date, token, status required' });
-
-    const ok = await sheets.updateBookingQueueStatus({ phone, date, token, status });
-    if (!ok) return res.status(404).json({ error: 'Booking not found' });
-    return res.json({ success: true });
-  } catch (err) {
-    console.error('api/queue/update error:', err.message);
-    return res.status(500).json({ error: err.message });
-  }
-});
-
-
-// ---------- 2e. Patient profile page (secure token link, Phase 3) ----------
-
-function buildPatientProfileFormHtml({ clinicName, patient, token }) {
-  const val = (key) => escapeHtml(patient[key] || '');
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Patient Profile - ${escapeHtml(clinicName)}</title>
-<style>
-  * { box-sizing: border-box; }
-  body { font-family: 'Segoe UI', Arial, sans-serif; margin: 0; padding: 24px 16px; background: #eef2f0; color: #1f2b26; }
-  .card { max-width: 560px; margin: 0 auto; background: #fff; border-radius: 14px; box-shadow: 0 4px 24px rgba(15,60,45,0.08); padding: 32px; }
-  h1 { color: #14532d; font-size: 20px; margin: 0 0 4px; }
-  p.sub { color: #6b7d74; font-size: 13px; margin: 0 0 22px; }
-  label { display: block; font-size: 12.5px; font-weight: 600; color: #3f5148; margin: 14px 0 5px; }
-  input, select, textarea { width: 100%; padding: 9px 11px; border: 1px solid #cdd9d3; border-radius: 8px; font-size: 14px; font-family: inherit; }
-  textarea { resize: vertical; min-height: 60px; }
-  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }
-  button { margin-top: 22px; width: 100%; padding: 12px; background: #14532d; color: #fff; border: none; border-radius: 9px; font-size: 15px; font-weight: 600; cursor: pointer; }
-  button:hover { background: #0f3f22; }
-</style>
-</head>
-<body>
-  <div class="card">
-    <h1>${escapeHtml(clinicName)} — Patient Profile</h1>
-    <p class="sub">Hi ${val('Name')}, please fill in a few extra details so the clinic has your complete profile.</p>
-    <form method="POST" action="/patient-profile/${escapeHtml(token)}">
-      <div class="row2">
-        <div><label>Date of Birth</label><input type="date" name="dob" value="${val('DOB')}"></div>
-        <div><label>Gender</label>
-          <select name="gender">
-            <option value="">Select</option>
-            <option value="Male" ${patient.Gender === 'Male' ? 'selected' : ''}>Male</option>
-            <option value="Female" ${patient.Gender === 'Female' ? 'selected' : ''}>Female</option>
-            <option value="Other" ${patient.Gender === 'Other' ? 'selected' : ''}>Other</option>
-          </select>
-        </div>
-      </div>
-      <label>Address</label>
-      <input type="text" name="address" value="${val('Address')}" placeholder="House/Street">
-      <div class="row2">
-        <div><label>City</label><input type="text" name="city" value="${val('City')}"></div>
-        <div><label>Blood Group</label><input type="text" name="bloodGroup" value="${val('Blood Group')}" placeholder="e.g. O+"></div>
-      </div>
-      <label>Allergies</label>
-      <textarea name="allergies" placeholder="e.g. Penicillin, dust">${val('Allergies')}</textarea>
-      <label>Previous Medical History</label>
-      <textarea name="medicalHistory" placeholder="e.g. Diabetes, past surgeries">${val('Medical History')}</textarea>
-      <label>Current Medicines</label>
-      <textarea name="currentMedicines" placeholder="Any medicines you take regularly">${val('Current Medicines')}</textarea>
-      <label>Emergency Contact Name</label>
-      <input type="text" name="emergencyName" value="${val('Emergency Contact Name')}">
-      <div class="row2">
-        <div><label>Relation</label><input type="text" name="emergencyRelation" value="${val('Emergency Contact Relation')}" placeholder="e.g. Spouse"></div>
-        <div><label>Phone</label><input type="tel" name="emergencyPhone" value="${val('Emergency Contact Phone')}"></div>
-      </div>
-      <button type="submit">Save Profile</button>
-    </form>
-  </div>
-</body>
-</html>`;
-}
-
-function buildProfileSavedHtml(clinicName) {
-  return `<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Profile Saved</title>
-<style>
-  body { font-family: 'Segoe UI', Arial, sans-serif; background: #eef2f0; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
-  .card { background: #fff; border-radius: 14px; box-shadow: 0 4px 24px rgba(15,60,45,0.08); padding: 40px; text-align: center; max-width: 380px; }
-  .tick { font-size: 42px; }
-  h1 { color: #14532d; font-size: 19px; margin: 12px 0 6px; }
-  p { color: #6b7d74; font-size: 13.5px; }
-</style></head>
-<body>
-  <div class="card">
-    <div class="tick">✅</div>
-    <h1>Profile Updated!</h1>
-    <p>Your information has been saved successfully at ${escapeHtml(clinicName)}. You can close this page now.</p>
-  </div>
-</body></html>`;
-}
-
-// Example link sent to patients: https://your-app.onrender.com/patient-profile/<random-token>
-app.get('/patient-profile/:token', async (req, res) => {
-  try {
-    const patient = await sheets.getPatientByProfileToken(req.params.token);
-    if (!patient) {
-      return res.status(404).send('This link is invalid or has expired. Please contact the clinic for a new link.');
-    }
-    const settings = await sheets.getSettings();
-    const html = buildPatientProfileFormHtml({
-      clinicName: settings.clinicName || CLINIC_NAME_FALLBACK,
-      patient,
-      token: req.params.token,
-    });
-    res.set('Content-Type', 'text/html');
-    res.send(html);
-  } catch (err) {
-    console.error('patient-profile GET error:', err.message);
-    res.status(500).send('Error loading profile page: ' + err.message);
-  }
-});
-
-app.post('/patient-profile/:token', async (req, res) => {
-  try {
-    const patient = await sheets.getPatientByProfileToken(req.params.token);
-    if (!patient) {
-      return res.status(404).send('This link is invalid or has expired. Please contact the clinic for a new link.');
-    }
-    const phone = String(patient['Phone Number'] || '').replace(/^'/, '');
-    await sheets.updatePatientProfileDetails(phone, {
-      dob: req.body.dob,
-      gender: req.body.gender,
-      address: req.body.address,
-      city: req.body.city,
-      bloodGroup: req.body.bloodGroup,
-      allergies: req.body.allergies,
-      medicalHistory: req.body.medicalHistory,
-      currentMedicines: req.body.currentMedicines,
-      emergencyName: req.body.emergencyName,
-      emergencyRelation: req.body.emergencyRelation,
-      emergencyPhone: req.body.emergencyPhone,
-    });
-    const settings = await sheets.getSettings();
-    res.set('Content-Type', 'text/html');
-    res.send(buildProfileSavedHtml(settings.clinicName || CLINIC_NAME_FALLBACK));
-  } catch (err) {
-    console.error('patient-profile POST error:', err.message);
-    res.status(500).send('Error saving profile: ' + err.message);
-  }
-});
+// ---------- 2e. New feature modules — routes ----------
+// Each module owns its own routes; server.js just mounts them with the same
+// shared secret used everywhere else (?secret=TRIGGER_SECRET).
+const moduleCtx = { TRIGGER_SECRET, CLINIC_NAME_FALLBACK };
+casepaperModule.registerRoutes(app, moduleCtx);
+profileModule.registerRoutes(app, moduleCtx);
+dashboardModule.registerRoutes(app, moduleCtx);
+queueModule.registerRoutes(app, moduleCtx);
+filesModule.registerRoutes(app, moduleCtx);
 
 // ---------- 3. Incoming WhatsApp messages ----------
 
@@ -1307,26 +832,4 @@ app.listen(PORT, () => {
   } else {
     console.warn('APP_BASE_URL or TRIGGER_SECRET not set — skipping Dashboard Link auto-publish.');
   }
-
-  // Auto-generate upcoming Capacity slots — no more manually opening
-  // /admin/generate-slots. Runs once immediately on startup (so a restart
-  // or redeploy always tops up the rolling 7-day window), then every 6
-  // hours after that. Running every 6h (not just once/24h) is deliberate:
-  // Render's free tier can sleep and wake at unpredictable times, so a
-  // tighter interval makes it much less likely a whole day gets missed.
-  const SLOT_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
-
-  async function runSlotGeneration() {
-    try {
-      const summary = await sheets.generateUpcomingSlots();
-      console.log(
-        `Auto slot generation: days ahead=${summary.daysAhead}, slots/day=${summary.slotsPerDay}, new rows added=${summary.added}`
-      );
-    } catch (err) {
-      console.error('Auto slot generation failed (check Settings tab Morning/Evening times):', err.message);
-    }
-  }
-
-  runSlotGeneration();
-  setInterval(runSlotGeneration, SLOT_REFRESH_INTERVAL_MS);
 });
