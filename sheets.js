@@ -22,7 +22,6 @@
 // we're already authenticated against it, and it survives restarts.
 
 const { google } = require('googleapis');
-const crypto = require('crypto');
 
 const SHEET_ID = process.env.GOOGLE_SHEET_ID;
 
@@ -43,8 +42,10 @@ function getSheetsClient() {
 async function readTab(tabName) {
   const sheets = await getSheetsClient();
   const res = await sheets.spreadsheets.values.get({
+    // A:BZ (not A:Z) — newer tabs like Patients/Records have well over 26
+    // columns once the extended profile + medical fields are added.
     spreadsheetId: SHEET_ID,
-    range: `${tabName}!A:Z`,
+    range: `${tabName}!A:BZ`,
   });
   const rows = res.data.values || [];
   if (rows.length === 0) return { header: [], rows: [] };
@@ -62,6 +63,158 @@ function rowToObject(header, row) {
 
 function stripQuote(phone) {
   return (phone || '').replace(/^'/, '');
+}
+
+// ---------- Generic tab helpers (used by the newer modules: counters,
+// patients, records, files, queue) ----------
+//
+// Older code above writes fixed-position A:E / A:J ranges by hand. Newer
+// code below writes by HEADER NAME instead — it reads the tab's header row,
+// finds each field's column index, and only touches the columns it was
+// given. This makes the new tabs easier to extend (add a column to the
+// Sheet, add one field to a fieldsObj — no range strings to update) and
+// lets two different features (e.g. the booking flow and the patient
+// profile page) update different columns of the same row safely.
+
+// 1-indexed column number -> spreadsheet column letters ("A", "Z", "AA"...).
+function colLetter(n) {
+  let s = '';
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    s = String.fromCharCode(65 + rem) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
+async function appendRow(tabName, values) {
+  const sheets = await getSheetsClient();
+  const endCol = colLetter(values.length);
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: SHEET_ID,
+    range: `${tabName}!A:${endCol}`,
+    valueInputOption: 'USER_ENTERED',
+    insertDataOption: 'INSERT_ROWS',
+    requestBody: { values: [values] },
+  });
+}
+
+async function updateRow(tabName, sheetRowNumber, values) {
+  const sheets = await getSheetsClient();
+  const endCol = colLetter(values.length);
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SHEET_ID,
+    range: `${tabName}!A${sheetRowNumber}:${endCol}${sheetRowNumber}`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: [values] },
+  });
+}
+
+// Finds the row where `matchColumn` equals `matchValue` (comparing with the
+// leading-apostrophe stripped, since phone numbers/dates/IDs are often
+// stored as `'PT-000001` to stop Sheets auto-formatting them) and merges
+// `fieldsObj` (keyed by exact header name) into it — creating a new row if
+// no match exists. Any header not mentioned in fieldsObj is left untouched.
+// Returns { isNew, row, header }.
+async function upsertByColumn(tabName, matchColumn, matchValue, fieldsObj) {
+  const { header, rows } = await readTab(tabName);
+  const matchIdx = header.indexOf(matchColumn);
+  if (matchIdx === -1) {
+    throw new Error(`upsertByColumn: column "${matchColumn}" not found in "${tabName}" tab header row.`);
+  }
+
+  const existingIndex = rows.findIndex((r) => stripQuote(r[matchIdx]) === matchValue);
+  const isNew = existingIndex === -1;
+  const baseRow = isNew ? new Array(header.length).fill('') : [...rows[existingIndex]];
+  while (baseRow.length < header.length) baseRow.push('');
+
+  header.forEach((colName, i) => {
+    if (Object.prototype.hasOwnProperty.call(fieldsObj, colName)) {
+      const val = fieldsObj[colName];
+      if (val !== undefined) baseRow[i] = val === null ? '' : val;
+    }
+  });
+
+  if (isNew) {
+    await appendRow(tabName, baseRow);
+  } else {
+    await updateRow(tabName, existingIndex + 2, baseRow);
+  }
+  return { isNew, row: rowToObject(header, baseRow), header };
+}
+
+// Finds a single row by an exact column match and returns it as an object
+// (or null). Used for lookups by ID (Patient ID, Booking ID, Record ID...).
+async function findRowByColumn(tabName, matchColumn, matchValue) {
+  const { header, rows } = await readTab(tabName);
+  const matchIdx = header.indexOf(matchColumn);
+  if (matchIdx === -1) return null;
+  const row = rows.find((r) => stripQuote(r[matchIdx]) === matchValue);
+  return row ? rowToObject(header, row) : null;
+}
+
+// Returns every row where `matchColumn` equals `matchValue`, as objects.
+async function findAllRowsByColumn(tabName, matchColumn, matchValue) {
+  const { header, rows } = await readTab(tabName);
+  const matchIdx = header.indexOf(matchColumn);
+  if (matchIdx === -1) return [];
+  return rows.filter((r) => stripQuote(r[matchIdx]) === matchValue).map((r) => rowToObject(header, r));
+}
+
+// Cache of tab title -> numeric sheetId (grid id), needed for row deletion
+// (batchUpdate deleteDimension addresses sheets by grid id, not title).
+let sheetIdCache = null;
+async function getSheetIdByTitle(tabName) {
+  const sheets = await getSheetsClient();
+  if (!sheetIdCache) {
+    const meta = await sheets.spreadsheets.get({ spreadsheetId: SHEET_ID });
+    sheetIdCache = {};
+    (meta.data.sheets || []).forEach((s) => {
+      sheetIdCache[s.properties.title] = s.properties.sheetId;
+    });
+  }
+  if (!(tabName in sheetIdCache)) {
+    // Tab may have been added after we cached — refresh once.
+    const meta = await sheets.spreadsheets.get({ spreadsheetId: SHEET_ID });
+    sheetIdCache = {};
+    (meta.data.sheets || []).forEach((s) => {
+      sheetIdCache[s.properties.title] = s.properties.sheetId;
+    });
+  }
+  return sheetIdCache[tabName];
+}
+
+// Deletes the row where `matchColumn` equals `matchValue`. Used for real
+// deletes (e.g. removing a Files row when a file is deleted) where marking
+// a status column isn't appropriate. No-op (returns false) if no match.
+async function deleteRowByColumn(tabName, matchColumn, matchValue) {
+  const { header, rows } = await readTab(tabName);
+  const matchIdx = header.indexOf(matchColumn);
+  if (matchIdx === -1) return false;
+  const existingIndex = rows.findIndex((r) => stripQuote(r[matchIdx]) === matchValue);
+  if (existingIndex === -1) return false;
+
+  const sheetId = await getSheetIdByTitle(tabName);
+  const sheetRowNumber = existingIndex + 2; // +1 header, +1 for 1-indexing
+  const sheets = await getSheetsClient();
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: SHEET_ID,
+    requestBody: {
+      requests: [
+        {
+          deleteDimension: {
+            range: {
+              sheetId,
+              dimension: 'ROWS',
+              startIndex: sheetRowNumber - 1,
+              endIndex: sheetRowNumber,
+            },
+          },
+        },
+      ],
+    },
+  });
+  return true;
 }
 
 // ---------- Settings ----------
@@ -172,43 +325,19 @@ async function getPatientProfile(phone) {
   };
 }
 
-// Returns the existing Patient ID for this phone if one is already on
-// record, otherwise generates and returns a brand new one (PT-000001, ...).
-// Does NOT write anything itself — the caller is expected to pass the
-// result into upsertPatientProfile so it gets persisted.
-async function getOrCreatePatientId(phone) {
-  const { header, rows } = await readTab('Patients');
-  const phoneIdx = header.indexOf('Phone Number');
-  const idIdx = header.indexOf('Patient ID');
-  if (phoneIdx !== -1) {
-    const row = rows.find((r) => stripQuote(r[phoneIdx]) === phone);
-    if (row && idIdx !== -1 && (row[idIdx] || '').trim()) {
-      return row[idIdx].trim();
-    }
-  }
-  return generatePatientId();
-}
-
-async function upsertPatientProfile(phone, { name, age, lang, lastVisitDate, patientId }) {
+async function upsertPatientProfile(phone, { name, age, lang, lastVisitDate }) {
   const sheets = await getSheetsClient();
   const { header, rows } = await readTab('Patients');
   const phoneIdx = header.indexOf('Phone Number');
 
-  const newRow = [
-    `'${phone}`,
-    name || '',
-    age || '',
-    lang || '',
-    lastVisitDate ? `'${lastVisitDate}` : '',
-    patientId || '',
-  ];
+  const newRow = [`'${phone}`, name || '', age || '', lang || '', lastVisitDate ? `'${lastVisitDate}` : ''];
 
   const existingIndex = phoneIdx === -1 ? -1 : rows.findIndex((r) => stripQuote(r[phoneIdx]) === phone);
 
   if (existingIndex === -1) {
     await sheets.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
-      range: 'Patients!A:F',
+      range: 'Patients!A:E',
       valueInputOption: 'USER_ENTERED',
       insertDataOption: 'INSERT_ROWS',
       requestBody: { values: [newRow] },
@@ -217,7 +346,7 @@ async function upsertPatientProfile(phone, { name, age, lang, lastVisitDate, pat
     const sheetRowNumber = existingIndex + 2;
     await sheets.spreadsheets.values.update({
       spreadsheetId: SHEET_ID,
-      range: `Patients!A${sheetRowNumber}:F${sheetRowNumber}`,
+      range: `Patients!A${sheetRowNumber}:E${sheetRowNumber}`,
       valueInputOption: 'USER_ENTERED',
       requestBody: { values: [newRow] },
     });
@@ -461,23 +590,10 @@ async function generateUpcomingSlots() {
 
 // ---------- Bookings ----------
 
-async function appendBooking({
-  name,
-  age,
-  reason,
-  date,
-  slot,
-  token,
-  phone,
-  paymentStatus,
-  visitType,
-  bookingId,
-  casePaperNumber,
-  patientId,
-}) {
+async function appendBooking({ name, age, reason, date, slot, token, phone, paymentStatus, visitType }) {
   const sheets = await getSheetsClient();
   // Column order here MUST match the actual Bookings tab:
-  // Timestamp | Phone Number | Name | Age | Reason | Date | Slot | Token Number | Payment Status | Visit Type | Booking ID | Case Paper Number | Patient ID
+  // Timestamp | Phone Number | Name | Age | Reason | Date | Slot | Token Number | Payment Status | Visit Type
   //
   // Date and Slot are written with a leading apostrophe (same trick as
   // phone numbers) to STOP Google Sheets from auto-converting "2026-09-05"
@@ -485,7 +601,7 @@ async function appendBooking({
   // 46270 and can never text-match what the bot compares against).
   await sheets.spreadsheets.values.append({
     spreadsheetId: SHEET_ID,
-    range: 'Bookings!A:M',
+    range: 'Bookings!A:J',
     valueInputOption: 'USER_ENTERED',
     insertDataOption: 'INSERT_ROWS',
     requestBody: {
@@ -501,9 +617,6 @@ async function appendBooking({
           token,
           paymentStatus || 'Paid',
           visitType || '',
-          bookingId || '',
-          casePaperNumber || '',
-          patientId || '',
         ],
       ],
     },
@@ -673,299 +786,251 @@ async function findBooking({ phone, date, token }) {
   return obj;
 }
 
-// ---------- Automatic numbering system (Counters tab) ----------
-// Backed by a "Counters" tab: Counter Type | Current Value | Updated At.
-//
-// CONCURRENCY NOTE: the Google Sheets API has no atomic "increment" call.
-// This does a read -> compute next -> write -> re-read-to-verify loop with
-// a few retries. At clinic scale (a handful of bookings happening around
-// the same time, not thousands per second) this is safe in practice, even
-// though it isn't a mathematically perfect lock. If two requests ever did
-// collide, the verify step catches it and retries with a fresh number
-// rather than silently handing out a duplicate.
-//
-// This phase ONLY adds the numbering infrastructure — it is not yet wired
-// into the booking flow, so nothing about the existing working system
-// changes yet. That wiring is a deliberate later step (Phase 2).
+// ---------- Counters tab (Counter Type | Current Value | Updated At) ----------
+// Raw read/write only — the increment-with-lock logic and ID formatting
+// (PT-000001, APT-2026-000001, etc.) lives in counters.js, which calls
+// these two functions. Kept here (not in counters.js) so counters.js has
+// no need to know about readTab/appendRow/updateRow internals.
 
-async function getNextNumber(counterType) {
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const sheets = await getSheetsClient();
-    const { rows } = await readTab('Counters');
-
-    const existingIndex = rows.findIndex((r) => (r[0] || '').trim() === counterType);
-    const current = existingIndex === -1 ? 0 : parseInt(rows[existingIndex][1], 10) || 0;
-    const next = current + 1;
-    const now = new Date().toISOString();
-
-    if (existingIndex === -1) {
-      await sheets.spreadsheets.values.append({
-        spreadsheetId: SHEET_ID,
-        range: 'Counters!A:C',
-        valueInputOption: 'USER_ENTERED',
-        insertDataOption: 'INSERT_ROWS',
-        requestBody: { values: [[counterType, next, now]] },
-      });
-    } else {
-      const rowNum = existingIndex + 2; // +1 header, +1 for 1-indexing
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: SHEET_ID,
-        range: `Counters!B${rowNum}:C${rowNum}`,
-        valueInputOption: 'USER_ENTERED',
-        requestBody: { values: [[next, now]] },
-      });
-    }
-
-    // Verify nobody else raced us to the same counter in the meantime.
-    const verify = await readTab('Counters');
-    const vIndex = verify.rows.findIndex((r) => (r[0] || '').trim() === counterType);
-    const confirmed = vIndex === -1 ? null : parseInt(verify.rows[vIndex][1], 10);
-
-    if (confirmed === next) {
-      return next;
-    }
-    // Someone else won the race — brief random wait, then retry with a
-    // fresh read (so we build on whatever value they left behind).
-    await new Promise((resolve) => setTimeout(resolve, 100 + Math.random() * 250));
-  }
-  throw new Error(`getNextNumber: could not safely increment counter "${counterType}" after several attempts.`);
+async function getCounterValue(counterType) {
+  const { header, rows } = await readTab('Counters');
+  const typeIdx = header.indexOf('Counter Type');
+  const valueIdx = header.indexOf('Current Value');
+  if (typeIdx === -1 || valueIdx === -1) return 0;
+  const row = rows.find((r) => (r[typeIdx] || '').trim() === counterType);
+  if (!row) return 0;
+  return parseInt(row[valueIdx], 10) || 0;
 }
 
-function padNumber(n, width) {
-  return String(n).padStart(width, '0');
-}
-
-// PT-000001, PT-000002, ...
-async function generatePatientId() {
-  const n = await getNextNumber('PatientID');
-  return `PT-${padNumber(n, 6)}`;
-}
-
-// APT-2026-000001, resets implicitly each year since the counter key
-// includes the year.
-async function generateAppointmentId() {
-  const year = new Date().getFullYear();
-  const n = await getNextNumber(`AppointmentID-${year}`);
-  return `APT-${year}-${padNumber(n, 6)}`;
-}
-
-// CP-2026-000001
-async function generateCasePaperNumber() {
-  const year = new Date().getFullYear();
-  const n = await getNextNumber(`CasePaper-${year}`);
-  return `CP-${year}-${padNumber(n, 6)}`;
-}
-
-// REC-2026-000001
-async function generateRecordNumber() {
-  const year = new Date().getFullYear();
-  const n = await getNextNumber(`Record-${year}`);
-  return `REC-${year}-${padNumber(n, 6)}`;
-}
-
-// RX-2026-000001
-async function generatePrescriptionNumber() {
-  const year = new Date().getFullYear();
-  const n = await getNextNumber(`Prescription-${year}`);
-  return `RX-${year}-${padNumber(n, 6)}`;
-}
-
-// 001, 002, ... — resets each day since the counter key includes the date.
-// NOTE: not wired into the live booking flow yet (which still uses the
-// existing daily-queue-position logic in getNextAvailableTokenForSlot) —
-// available for Phase 2 to switch over to, or use in parallel.
-async function generateDailyToken(dateStr) {
-  const n = await getNextNumber(`DailyToken-${dateStr}`);
-  return padNumber(n, 3);
-}
-
-// ---------- Patient Profile secure link (Phase 3) ----------
-// Extended Patients columns (appended after Patient ID, so nothing existing
-// shifts): Profile Token | Profile Token Expiry | Profile Completed | DOB |
-// Gender | Address | City | Blood Group | Allergies | Medical History |
-// Current Medicines | Emergency Contact Name | Emergency Contact Relation |
-// Emergency Contact Phone  (columns G through T)
-//
-// Security: the link uses only this random unguessable token — never the
-// phone number or Patient ID — and expires after a configurable number of
-// days.
-
-function generateProfileToken() {
-  return crypto.randomBytes(24).toString('hex'); // 48 hex chars, unguessable
-}
-
-// Issues (or reissues) a profile-update token for this phone. Assumes a
-// Patients row for this phone already exists (call this after
-// upsertPatientProfile has run for the same booking).
-async function issueProfileToken(phone, validDays = 30) {
-  const sheets = await getSheetsClient();
-  const { header, rows } = await readTab('Patients');
-  const phoneIdx = header.indexOf('Phone Number');
-  const existingIndex = phoneIdx === -1 ? -1 : rows.findIndex((r) => stripQuote(r[phoneIdx]) === phone);
-  if (existingIndex === -1) return null;
-
-  const token = generateProfileToken();
-  const expiry = new Date(Date.now() + validDays * 24 * 60 * 60 * 1000).toISOString();
-  const rowNum = existingIndex + 2;
-
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: SHEET_ID,
-    range: `Patients!G${rowNum}:H${rowNum}`,
-    valueInputOption: 'USER_ENTERED',
-    requestBody: { values: [[token, expiry]] },
+async function setCounterValue(counterType, value) {
+  await upsertByColumn('Counters', 'Counter Type', counterType, {
+    'Counter Type': counterType,
+    'Current Value': value,
+    'Updated At': new Date().toISOString(),
   });
-
-  return token;
 }
 
-// Looks up a patient by their profile token only — returns null if not
-// found or expired. Never accepts phone/Patient ID directly.
+// ---------- Patients tab (extended profile) ----------
+// Columns beyond the original Phone Number/Name/Age/Lang/Last Visit Date:
+// Patient ID | Date of Birth | Gender | Address | City | Blood Group |
+// Allergies | Medical History | Current Medicines | Emergency Contact Name |
+// Emergency Contact Relation | Emergency Contact Phone | Profile Token |
+// Profile Token Expiry | Profile Completed | Total Visits | Created At |
+// Updated At
+//
+// These functions are ADDITIVE — the original getPatientProfile/
+// upsertPatientProfile above are untouched and keep working exactly as
+// before for the WhatsApp booking flow. Use these when you need the
+// extended fields (patient profile page, dashboard, case paper history).
+
+async function getPatientFullProfile(phone) {
+  return findRowByColumn('Patients', 'Phone Number', phone);
+}
+
+async function getPatientByPatientId(patientId) {
+  return findRowByColumn('Patients', 'Patient ID', patientId);
+}
+
+// Ensures this phone number has a Patient ID, generating one via
+// counters.nextPatientId() if it doesn't. Returns the Patient ID.
+// Takes the id-generator as a parameter (rather than require()-ing
+// counters.js here) to avoid a circular require between sheets.js and
+// counters.js, since counters.js itself calls getCounterValue/setCounterValue
+// above.
+async function ensurePatientId(phone, generateId) {
+  const existing = await getPatientFullProfile(phone);
+  if (existing && existing['Patient ID']) return existing['Patient ID'];
+
+  const patientId = await generateId();
+  await upsertByColumn('Patients', 'Phone Number', phone, {
+    'Phone Number': `'${phone}`,
+    'Patient ID': patientId,
+    'Created At': (existing && existing['Created At']) || new Date().toISOString(),
+    'Updated At': new Date().toISOString(),
+  });
+  return patientId;
+}
+
+// Partial update of the extended profile fields — only touches the keys
+// present in `fields` (exact header names as documented above). Used by
+// the patient self-service profile page and by staff editing from the
+// dashboard. Also bumps "Updated At".
+async function updatePatientExtendedProfile(phone, fields) {
+  const payload = { ...fields, 'Updated At': new Date().toISOString() };
+  const { row } = await upsertByColumn('Patients', 'Phone Number', phone, payload);
+  return row;
+}
+
+async function incrementPatientVisitCount(phone, lastVisitDate) {
+  const existing = await getPatientFullProfile(phone);
+  const current = (existing && parseInt(existing['Total Visits'], 10)) || 0;
+  await upsertByColumn('Patients', 'Phone Number', phone, {
+    'Total Visits': current + 1,
+    'Last Visit Date': lastVisitDate ? `'${lastVisitDate}` : '',
+    'Updated At': new Date().toISOString(),
+  });
+}
+
+// ---------- Secure patient-profile links ----------
+// Token itself (long random string) is generated in profile.js using
+// crypto.randomBytes — sheets.js only stores/looks it up so the phone
+// number and Patient ID never appear in the URL.
+
+async function setProfileToken(phone, token, expiryIso) {
+  await upsertByColumn('Patients', 'Phone Number', phone, {
+    'Profile Token': token,
+    'Profile Token Expiry': expiryIso || '',
+  });
+}
+
 async function getPatientByProfileToken(token) {
-  const { header, rows } = await readTab('Patients');
-  const tokenIdx = header.indexOf('Profile Token');
-  const expiryIdx = header.indexOf('Profile Token Expiry');
-  if (tokenIdx === -1) return null;
-
-  const row = rows.find((r) => (r[tokenIdx] || '').trim() === token);
-  if (!row) return null;
-
-  if (expiryIdx !== -1) {
-    const expiry = row[expiryIdx];
-    if (expiry && new Date(expiry).getTime() < Date.now()) return null; // expired
-  }
-
-  return rowToObject(header, row);
+  return findRowByColumn('Patients', 'Profile Token', token);
 }
 
-// Saves the extended profile fields the patient filled in themselves.
-async function updatePatientProfileDetails(phone, details) {
-  const sheets = await getSheetsClient();
-  const { header, rows } = await readTab('Patients');
-  const phoneIdx = header.indexOf('Phone Number');
-  const existingIndex = phoneIdx === -1 ? -1 : rows.findIndex((r) => stripQuote(r[phoneIdx]) === phone);
-  if (existingIndex === -1) return false;
-
-  const rowNum = existingIndex + 2;
-  const values = [
-    'Yes', // Profile Completed
-    details.dob || '',
-    details.gender || '',
-    details.address || '',
-    details.city || '',
-    details.bloodGroup || '',
-    details.allergies || '',
-    details.medicalHistory || '',
-    details.currentMedicines || '',
-    details.emergencyName || '',
-    details.emergencyRelation || '',
-    details.emergencyPhone || '',
-  ];
-
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: SHEET_ID,
-    range: `Patients!I${rowNum}:T${rowNum}`,
-    valueInputOption: 'USER_ENTERED',
-    requestBody: { values: [values] },
-  });
-  return true;
-}
-
-// ---------- Full dashboard support: Patients list + Live Queue (Phase 4) ----------
-
-// All patients with computed visit stats — used by the Patients tab of the
-// dashboard. Cross-references Bookings to count total visits, since that's
-// more reliable than trusting a manually-editable counter.
-async function getAllPatients() {
-  const patientsTab = await readTab('Patients');
-  const bookingsTab = await readTab('Bookings');
-  const bPhoneIdx = bookingsTab.header.indexOf('Phone Number');
-  const bDateIdx = bookingsTab.header.indexOf('Date');
-
-  const visitCounts = {};
-  const lastVisits = {};
-  if (bPhoneIdx !== -1) {
-    bookingsTab.rows.forEach((r) => {
-      const phone = stripQuote(r[bPhoneIdx]);
-      if (!phone) return;
-      visitCounts[phone] = (visitCounts[phone] || 0) + 1;
-      if (bDateIdx !== -1) {
-        const d = stripQuote(r[bDateIdx]).trim();
-        if (d && (!lastVisits[phone] || d > lastVisits[phone])) lastVisits[phone] = d;
-      }
+async function searchPatients(query) {
+  const { rows } = await readTab('Patients');
+  const q = (query || '').trim().toLowerCase();
+  if (!q) return [];
+  const { header } = await readTab('Patients');
+  return rows
+    .map((r) => rowToObject(header, r))
+    .filter((p) => {
+      const name = (p.Name || '').toLowerCase();
+      const phone = stripQuote(p['Phone Number'] || '');
+      const patientId = (p['Patient ID'] || '').toLowerCase();
+      return name.includes(q) || phone.includes(q) || patientId.includes(q.toUpperCase()) || patientId.includes(q);
     });
-  }
-
-  return patientsTab.rows
-    .map((r) => {
-      const obj = rowToObject(patientsTab.header, r);
-      const phone = stripQuote(obj['Phone Number']);
-      return {
-        phone,
-        name: obj.Name,
-        age: obj.Age,
-        patientId: obj['Patient ID'] || '',
-        lastVisit: lastVisits[phone] || stripQuote(obj['Last Visit Date']) || '',
-        totalVisits: visitCounts[phone] || 0,
-      };
-    })
-    .filter((p) => p.name);
 }
 
-// Updates the "Queue Status" column for one booking (Waiting / Called /
-// In Progress / Completed / Skipped / No Show). Requires a "Queue Status"
-// column somewhere in the Bookings tab — falls back to column N if the
-// header text isn't found, so it still works even before that column is
-// formally added/labeled.
-async function updateBookingQueueStatus({ phone, date, token, status }) {
-  const sheets = await getSheetsClient();
-  const { header, rows } = await readTab('Bookings');
-  const phoneIdx = header.indexOf('Phone Number');
-  const dateIdx = header.indexOf('Date');
-  const tokenIdx = header.indexOf('Token Number');
-  let statusIdx = header.indexOf('Queue Status');
-  if (phoneIdx === -1 || dateIdx === -1 || tokenIdx === -1) return false;
-  if (statusIdx === -1) statusIdx = 13; // column N fallback
+async function getAllPatients() {
+  const { header, rows } = await readTab('Patients');
+  return rows.map((r) => rowToObject(header, r));
+}
 
-  const rowIndex = rows.findIndex(
-    (r) =>
-      stripQuote(r[phoneIdx]) === phone &&
-      stripQuote(r[dateIdx]).trim() === date.trim() &&
-      String(r[tokenIdx]).trim() === String(token).trim()
-  );
-  if (rowIndex === -1) return false;
+// ---------- Bookings tab (extended) ----------
+// New columns beyond the original Timestamp..Visit Type:
+// Booking ID | Patient ID | Case Paper Number | Booking Status |
+// Queue Status | Updated At
+//
+// appendBookingRow writes by HEADER NAME (unlike the original fixed-array
+// appendBooking above, which is left untouched for safety). This is the
+// version finalizeBooking() in server.js calls now, so every new booking
+// gets its Booking ID / Patient ID / Case Paper Number recorded on the
+// same row instead of needing a second write.
 
-  const rowNum = rowIndex + 2;
-  const colLetter = String.fromCharCode(65 + statusIdx);
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: SHEET_ID,
-    range: `Bookings!${colLetter}${rowNum}`,
-    valueInputOption: 'USER_ENTERED',
-    requestBody: { values: [[status]] },
+async function appendBookingRow(fields) {
+  const { header } = await readTab('Bookings');
+  const row = new Array(header.length).fill('');
+  header.forEach((colName, i) => {
+    if (Object.prototype.hasOwnProperty.call(fields, colName)) {
+      row[i] = fields[colName] === undefined || fields[colName] === null ? '' : fields[colName];
+    }
   });
-  return true;
+  await appendRow('Bookings', row);
+}
+
+async function getBookingByBookingId(bookingId) {
+  return findRowByColumn('Bookings', 'Booking ID', bookingId);
+}
+
+async function updateBookingByBookingId(bookingId, fields) {
+  const payload = { ...fields, 'Updated At': new Date().toISOString() };
+  const { row } = await upsertByColumn('Bookings', 'Booking ID', bookingId, payload);
+  return row;
+}
+
+async function getBookingsForPatientId(patientId) {
+  return findAllRowsByColumn('Bookings', 'Patient ID', patientId);
+}
+
+// ---------- Records tab (diagnosis / doctor notes, linked to a booking) ----------
+// Record ID | Patient ID | Booking ID | Case Paper Number | Date |
+// Doctor Name | Reason | Diagnosis | Doctor Notes | Prescription ID | Created At
+
+async function appendRecord(fields) {
+  const { header } = await readTab('Records');
+  const row = new Array(header.length).fill('');
+  header.forEach((colName, i) => {
+    if (Object.prototype.hasOwnProperty.call(fields, colName)) {
+      row[i] = fields[colName] === undefined || fields[colName] === null ? '' : fields[colName];
+    }
+  });
+  await appendRow('Records', row);
+}
+
+async function getRecordsForPatient(patientId) {
+  return findAllRowsByColumn('Records', 'Patient ID', patientId);
+}
+
+async function getRecordByBookingId(bookingId) {
+  return findRowByColumn('Records', 'Booking ID', bookingId);
+}
+
+// ---------- Files tab (metadata only — actual bytes live in Google Drive) ----------
+// File ID | Patient ID | Record ID | File Name | File Type |
+// Google Drive File ID | Google Drive URL | Uploaded By | Uploaded At
+
+async function appendFileMeta(fields) {
+  const { header } = await readTab('Files');
+  const row = new Array(header.length).fill('');
+  header.forEach((colName, i) => {
+    if (Object.prototype.hasOwnProperty.call(fields, colName)) {
+      row[i] = fields[colName] === undefined || fields[colName] === null ? '' : fields[colName];
+    }
+  });
+  await appendRow('Files', row);
+}
+
+async function getFilesForPatient(patientId) {
+  return findAllRowsByColumn('Files', 'Patient ID', patientId);
+}
+
+async function getFileById(fileId) {
+  return findRowByColumn('Files', 'File ID', fileId);
+}
+
+async function deleteFileMeta(fileId) {
+  return deleteRowByColumn('Files', 'File ID', fileId);
+}
+
+// ---------- Queue tab (live token queue for a given day) ----------
+// Date | Token Number | Booking ID | Patient ID | Status | Checked In At |
+// Called At | Started At | Completed At
+// Status values: Waiting | Checked-In | Called | In-Consultation | Completed | Skipped | No-Show
+
+async function appendQueueEntry(fields) {
+  const { header } = await readTab('Queue');
+  const row = new Array(header.length).fill('');
+  header.forEach((colName, i) => {
+    if (Object.prototype.hasOwnProperty.call(fields, colName)) {
+      row[i] = fields[colName] === undefined || fields[colName] === null ? '' : fields[colName];
+    }
+  });
+  await appendRow('Queue', row);
+}
+
+async function getQueueForDate(dateStr) {
+  const { header, rows } = await readTab('Queue');
+  const dateIdx = header.indexOf('Date');
+  if (dateIdx === -1) return [];
+  return rows
+    .filter((r) => stripQuote(r[dateIdx]).trim() === dateStr.trim())
+    .map((r) => rowToObject(header, r));
+}
+
+async function updateQueueEntryByBookingId(bookingId, fields) {
+  const { row } = await upsertByColumn('Queue', 'Booking ID', bookingId, fields);
+  return row;
 }
 
 module.exports = {
   getSettings,
   setSettingValue,
-  getNextNumber,
-  generatePatientId,
-  generateAppointmentId,
-  generateCasePaperNumber,
-  generateRecordNumber,
-  generatePrescriptionNumber,
-  generateDailyToken,
   getPatientProfile,
-  getOrCreatePatientId,
   upsertPatientProfile,
-  issueProfileToken,
-  getPatientByProfileToken,
-  updatePatientProfileDetails,
   getVisitType,
   getLastVisitDate,
   getBookingsForDate,
-  getAllPatients,
-  updateBookingQueueStatus,
   getMedicineDatabase,
   findBooking,
   getAvailableSlots,
@@ -976,4 +1041,52 @@ module.exports = {
   setPendingState,
   clearPendingState,
   findPendingByLastDigits,
+
+  // generic (used by newer modules)
+  readTab,
+  rowToObject,
+  stripQuote,
+  appendRow,
+  updateRow,
+  upsertByColumn,
+  findRowByColumn,
+  findAllRowsByColumn,
+  deleteRowByColumn,
+
+  // counters
+  getCounterValue,
+  setCounterValue,
+
+  // extended patients
+  getPatientFullProfile,
+  getPatientByPatientId,
+  ensurePatientId,
+  updatePatientExtendedProfile,
+  incrementPatientVisitCount,
+  setProfileToken,
+  getPatientByProfileToken,
+  searchPatients,
+  getAllPatients,
+
+  // extended bookings
+  appendBookingRow,
+  getBookingByBookingId,
+  updateBookingByBookingId,
+  getBookingsForPatientId,
+
+  // records
+  appendRecord,
+  getRecordsForPatient,
+  getRecordByBookingId,
+
+  // files
+  appendFileMeta,
+  getFilesForPatient,
+  getFileById,
+  deleteFileMeta,
+
+  // queue
+  appendQueueEntry,
+  getQueueForDate,
+  updateQueueEntryByBookingId,
 };
