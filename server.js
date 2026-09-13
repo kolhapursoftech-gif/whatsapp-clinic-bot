@@ -1307,4 +1307,26 @@ app.listen(PORT, () => {
   } else {
     console.warn('APP_BASE_URL or TRIGGER_SECRET not set — skipping Dashboard Link auto-publish.');
   }
+
+  // Auto-generate upcoming Capacity slots — no more manually opening
+  // /admin/generate-slots. Runs once immediately on startup (so a restart
+  // or redeploy always tops up the rolling 7-day window), then every 6
+  // hours after that. Running every 6h (not just once/24h) is deliberate:
+  // Render's free tier can sleep and wake at unpredictable times, so a
+  // tighter interval makes it much less likely a whole day gets missed.
+  const SLOT_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+  async function runSlotGeneration() {
+    try {
+      const summary = await sheets.generateUpcomingSlots();
+      console.log(
+        `Auto slot generation: days ahead=${summary.daysAhead}, slots/day=${summary.slotsPerDay}, new rows added=${summary.added}`
+      );
+    } catch (err) {
+      console.error('Auto slot generation failed (check Settings tab Morning/Evening times):', err.message);
+    }
+  }
+
+  runSlotGeneration();
+  setInterval(runSlotGeneration, SLOT_REFRESH_INTERVAL_MS);
 });
