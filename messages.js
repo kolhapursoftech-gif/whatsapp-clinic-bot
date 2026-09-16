@@ -56,11 +56,12 @@ const TEMPLATES = {
     screenshotReceived: '✅ Dhanyawad! Tumcha payment screenshot milala.\nStaff verify karat aahet, kripaya thoda vel thamba.',
     askForScreenshot: '📸 Kripaya payment cha screenshot (photo) pathva.',
     stillWaiting: '⏳ Amhi tumcha payment verify karat aahot. Kripaya thoda vel thamba, confirmation lavkarach yeil.',
-    bookingConfirmed: (clinic, name, token, dateStr, slotLabel, patientId, bookingId) =>
-      `✅ *${clinic}*\n*Booking Confirm Zali!*\n\n👤 Naav: *${name}*\n🎟️ Token Number: *${token}*\n📅 Date: *${dateStr}*\n🕒 Vel: *${slotLabel}*${patientId ? `\n🆔 Patient ID: *${patientId}*` : ''}${bookingId ? `\n📄 Booking ID: *${bookingId}*` : ''}\n\nKripaya tumcha token number sobat ghevun ya.`,
+    bookingConfirmed: (clinic, name, token, dateStr, slotLabel) =>
+      `✅ *${clinic}*\n*Booking Confirm Zali!*\n\n👤 Naav: *${name}*\n🎟️ Token Number: *${token}*\n📅 Date: *${dateStr}*\n🕒 Vel: *${slotLabel}*\n\nKripaya tumcha token number sobat ghevun ya.`,
     slotNowFull: '😔 Kshama kara, tumchi nivadleli vel ata full zali aahe. Kripaya doctor shi sampark sadha.',
     profileLinkMessage: (link) =>
-      `📝 Tumchi aankhi thodi mahiti (blood group, allergies, ityadi) bharun tumcha *patient profile* purna karayla, khali dilela link ughada:\n${link}`,
+      `📝 Tumchi kahi additional mahiti (address, allergies, emergency contact) purna karnyasathi khali dilela secure link ughda:\n${link}`,
+    queueAlert: '🔔 Tumcha number lavkarach yenar aahe. Kripaya clinic kade yenyachi taiyari theva.',
   },
 
   hi: {
@@ -92,11 +93,12 @@ const TEMPLATES = {
     screenshotReceived: '✅ Dhanyawad! Aapka payment screenshot mil gaya.\nStaff verify kar rahe hain, kripya thoda intezaar karein.',
     askForScreenshot: '📸 Kripya payment ka screenshot (photo) bhejein.',
     stillWaiting: '⏳ Hum aapka payment verify kar rahe hain. Kripya thoda intezaar karein, confirmation jald aayega.',
-    bookingConfirmed: (clinic, name, token, dateStr, slotLabel, patientId, bookingId) =>
-      `✅ *${clinic}*\n*Booking Confirm Ho Gayi!*\n\n👤 Naam: *${name}*\n🎟️ Token Number: *${token}*\n📅 Date: *${dateStr}*\n🕒 Samay: *${slotLabel}*${patientId ? `\n🆔 Patient ID: *${patientId}*` : ''}${bookingId ? `\n📄 Booking ID: *${bookingId}*` : ''}\n\nKripya apna token number saath layein.`,
+    bookingConfirmed: (clinic, name, token, dateStr, slotLabel) =>
+      `✅ *${clinic}*\n*Booking Confirm Ho Gayi!*\n\n👤 Naam: *${name}*\n🎟️ Token Number: *${token}*\n📅 Date: *${dateStr}*\n🕒 Samay: *${slotLabel}*\n\nKripya apna token number saath layein.`,
     slotNowFull: '😔 Maaf kijiye, aapka chuna hua samay ab full ho gaya hai. Kripya doctor se sampark karein.',
     profileLinkMessage: (link) =>
-      `📝 Apni thodi aur jaankari (blood group, allergies, aadi) bharkar apna *patient profile* poora karne ke liye, neeche diya gaya link kholein:\n${link}`,
+      `📝 Apni kuch additional jaankari (address, allergies, emergency contact) poori karne ke liye neeche diya gaya secure link kholein:\n${link}`,
+    queueAlert: '🔔 Aapka number jald aane wala hai. Kripya clinic aane ki taiyari rakhein.',
   },
 
   en: {
@@ -128,11 +130,12 @@ const TEMPLATES = {
     screenshotReceived: '✅ Thank you! We received your payment screenshot.\nOur staff is verifying it, please wait a moment.',
     askForScreenshot: '📸 Please send a screenshot (photo) of your payment.',
     stillWaiting: "⏳ We're still verifying your payment. Please wait a bit, confirmation will arrive soon.",
-    bookingConfirmed: (clinic, name, token, dateStr, slotLabel, patientId, bookingId) =>
-      `✅ *${clinic}*\n*Booking Confirmed!*\n\n👤 Name: *${name}*\n🎟️ Token Number: *${token}*\n📅 Date: *${dateStr}*\n🕒 Time: *${slotLabel}*${patientId ? `\n🆔 Patient ID: *${patientId}*` : ''}${bookingId ? `\n📄 Booking ID: *${bookingId}*` : ''}\n\nPlease bring your token number with you.`,
+    bookingConfirmed: (clinic, name, token, dateStr, slotLabel) =>
+      `✅ *${clinic}*\n*Booking Confirmed!*\n\n👤 Name: *${name}*\n🎟️ Token Number: *${token}*\n📅 Date: *${dateStr}*\n🕒 Time: *${slotLabel}*\n\nPlease bring your token number with you.`,
     slotNowFull: '😔 Sorry, your chosen time slot just got fully booked. Please contact the doctor.',
     profileLinkMessage: (link) =>
-      `📝 To complete your *patient profile* with a few extra details (blood group, allergies, etc.), open this link:\n${link}`,
+      `📝 Please open the secure link below to complete a few additional details (address, allergies, emergency contact):\n${link}`,
+    queueAlert: '🔔 Your turn is coming up soon. Please make your way to the clinic.',
   },
 };
 
