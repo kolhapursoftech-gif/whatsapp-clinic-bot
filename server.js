@@ -2,7 +2,6 @@
 require('dotenv').config();
 
 const express = require('express');
-const axios = require('axios');
 const whatsapp = require('./whatsapp');
 const sheets = require('./sheets');
 const { getMessages, LANGUAGE_BUTTONS, languagePrompt, SAME_PATIENT_BUTTONS } = require('./messages');
@@ -16,6 +15,7 @@ const queueModule = require('./queue');
 const filesModule = require('./files');
 const dashboardModule = require('./dashboard');
 const casepaperModule = require('./casepaper');
+const { sendUnauthorized } = require('./ui');
 
 const app = express();
 app.use(express.json());
@@ -23,16 +23,10 @@ app.use(express.json());
 // (no JS framework) — those submit as application/x-www-form-urlencoded.
 app.use(express.urlencoded({ extended: true }));
 
-// Lightweight, unauthenticated health-check — used by our own self-ping
-// below (Render free-tier keep-alive) and safe to hit from any uptime
-// monitor too. Does not touch Google Sheets/Drive, so it never eats into
-// API quota.
-app.get('/ping', (req, res) => res.status(200).send('OK'));
-
 const CLINIC_NAME_FALLBACK = process.env.CLINIC_NAME || 'the clinic';
 const DOCTOR_NUMBER = process.env.DOCTOR_WHATSAPP_NUMBER; // fallback if Settings tab has none
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
-const TRIGGER_SECRET = process.env.TRIGGER_SECRET;
+const TRIGGER_SECRET = (process.env.TRIGGER_SECRET || '').trim();
 
 const CONFIRM_REGEX = /^CONFIRM\s+(\d{3,4})$/i;
 const LANG_MAP = { lang_mr: 'mr', lang_hi: 'hi', lang_en: 'en' };
@@ -355,7 +349,7 @@ app.post('/trigger-missed-call', async (req, res) => {
 // Example: https://your-app.onrender.com/admin/generate-slots?secret=YOUR_SECRET
 app.get('/admin/generate-slots', async (req, res) => {
   if (req.query.secret !== TRIGGER_SECRET) {
-    return res.sendStatus(401);
+    return sendUnauthorized(res);
   }
   try {
     const summary = await sheets.generateUpcomingSlots();
@@ -546,7 +540,7 @@ function buildDashboardHtml({ clinicName, dateStr, bookings, secret }) {
 // Optional &date=YYYY-MM-DD (defaults to today).
 app.get('/dashboard', async (req, res) => {
   if (req.query.secret !== TRIGGER_SECRET) {
-    return res.sendStatus(401);
+    return sendUnauthorized(res);
   }
   try {
     const settings = await sheets.getSettings();
@@ -824,56 +818,22 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
+// ---------- Safety net: catch anything any route above didn't handle ----------
+// itself (a thrown error, a rejected promise Express catches automatically
+// in v5, or a bug we missed). Without this, such a crash can render as a
+// blank/default page with no clue what happened.
+app.use((err, req, res, next) => {
+  console.error('Unhandled error on', req.method, req.path, ':', err && err.stack ? err.stack : err);
+  if (res.headersSent) return next(err);
+  res.status(500).send('Something went wrong on the server. Check the Render logs for details — search for "Unhandled error on ' + req.path + '".');
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`WhatsApp clinic bot listening on port ${PORT}`);
 
-  // ---------- Automatic daily slot generation ----------
-  // generateUpcomingSlots() was previously only reachable by manually
-  // visiting /admin/generate-slots — if nobody opened that link on a given
-  // day, the Capacity tab stopped growing and slots silently ran out.
-  // Now it also runs once at startup and then every 24 hours for as long
-  // as this process stays alive.
-  //
-  // CAVEAT (Render free tier): a free web service "sleeps" after ~15 min
-  // with no incoming traffic, which pauses this timer too. To guarantee it
-  // runs even while asleep, also set up an external ping once a day to
-  // /admin/generate-slots?secret=YOUR_SECRET (Render's own Cron Jobs
-  // feature, or a free service like cron-job.org / UptimeRobot) — that
-  // request also wakes the service up, so the two approaches complement
-  // each other rather than duplicating work (generateUpcomingSlots is
-  // idempotent: re-running it never creates duplicate slot rows).
-  function runSlotGeneration(trigger) {
-    sheets
-      .generateUpcomingSlots()
-      .then((summary) =>
-        console.log(`[${trigger}] generateUpcomingSlots: added ${summary.added} new slot rows (daysAhead=${summary.daysAhead}, slotsPerDay=${summary.slotsPerDay})`)
-      )
-      .catch((err) => console.error(`[${trigger}] generateUpcomingSlots failed:`, err.message));
-  }
-  runSlotGeneration('startup');
-  setInterval(() => runSlotGeneration('daily-timer'), 24 * 60 * 60 * 1000);
-
-  // ---------- Self-ping keep-alive (Render free-tier workaround) ----------
-  // Render's free web services sleep after ~15 minutes with no INCOMING
-  // request, which also pauses every setInterval above. Hitting our own
-  // public /ping URL every 10 minutes is itself an incoming request from
-  // Render's point of view, so it resets that idle timer — no external
-  // cron service, no paid plan, nothing to sign up for.
-  // Honest caveat: this is a widely-used workaround, not an official
-  // Render guarantee — if Render's spin-down policy changes, this could
-  // stop being effective. If you ever move to a paid Render plan (which
-  // doesn't sleep), this block is harmless and simply becomes a no-op.
-  if (APP_BASE_URL) {
-    setInterval(() => {
-      axios.get(`${APP_BASE_URL}/ping`, { timeout: 10000 }).catch((err) => {
-        console.warn('self-ping failed (non-fatal):', err.message);
-      });
-    }, 10 * 60 * 1000);
-  } else {
-    console.warn('APP_BASE_URL not set — self-ping keep-alive disabled (service may sleep on Render free tier).');
-  }
-
+  // Publish the dashboard link into the Settings tab so the clinic can just
+  // open the Sheet and copy it, instead of building the URL by hand.
   if (APP_BASE_URL && TRIGGER_SECRET) {
     const dashboardLink = `${APP_BASE_URL}/dashboard?secret=${TRIGGER_SECRET}`;
     sheets

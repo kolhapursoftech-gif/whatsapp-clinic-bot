@@ -12,7 +12,7 @@
 const sheets = require('./sheets');
 const whatsapp = require('./whatsapp');
 const { getMessages } = require('./messages');
-const { pageShell, escapeHtml } = require('./ui');
+const { pageShell, escapeHtml, sendUnauthorized } = require('./ui');
 
 function sortByToken(entries) {
   return [...entries].sort((a, b) => (parseInt(a['Token Number'], 10) || 0) - (parseInt(b['Token Number'], 10) || 0));
@@ -172,7 +172,7 @@ function registerRoutes(app, ctx) {
   }
 
   app.get('/queue', async (req, res) => {
-    if (req.query.secret !== TRIGGER_SECRET) return res.sendStatus(401);
+    if (req.query.secret !== TRIGGER_SECRET) return sendUnauthorized(res);
     try {
       const settings = await sheets.getSettings();
       const dateStr = req.query.date || istDateString(0);
@@ -202,7 +202,7 @@ function registerRoutes(app, ctx) {
   });
 
   app.post('/queue/:bookingId/action', async (req, res) => {
-    if (req.query.secret !== TRIGGER_SECRET) return res.sendStatus(401);
+    if (req.query.secret !== TRIGGER_SECRET) return sendUnauthorized(res);
     const { bookingId } = req.params;
     const { action, date } = req.query;
     try {

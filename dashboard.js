@@ -11,7 +11,7 @@
 
 const sheets = require('./sheets');
 const patientsDomain = require('./patients');
-const { pageShell, escapeHtml } = require('./ui');
+const { pageShell, escapeHtml, sendUnauthorized } = require('./ui');
 
 function istDateString(offsetDays = 0) {
   const now = new Date();
@@ -288,7 +288,7 @@ function registerRoutes(app, ctx) {
   const { TRIGGER_SECRET, CLINIC_NAME_FALLBACK } = ctx;
 
   app.get('/dashboard/home', async (req, res) => {
-    if (req.query.secret !== TRIGGER_SECRET) return res.sendStatus(401);
+    if (req.query.secret !== TRIGGER_SECRET) return sendUnauthorized(res);
     try {
       const settings = await sheets.getSettings();
       const html = await buildDashboardHomeHtml({
@@ -304,7 +304,7 @@ function registerRoutes(app, ctx) {
   });
 
   app.get('/patients', async (req, res) => {
-    if (req.query.secret !== TRIGGER_SECRET) return res.sendStatus(401);
+    if (req.query.secret !== TRIGGER_SECRET) return sendUnauthorized(res);
     try {
       const settings = await sheets.getSettings();
       const html = await buildPatientsListHtml({
@@ -321,7 +321,7 @@ function registerRoutes(app, ctx) {
   });
 
   app.get('/patients/:patientId', async (req, res) => {
-    if (req.query.secret !== TRIGGER_SECRET) return res.sendStatus(401);
+    if (req.query.secret !== TRIGGER_SECRET) return sendUnauthorized(res);
     try {
       const settings = await sheets.getSettings();
       const html = await buildPatientDetailHtml({

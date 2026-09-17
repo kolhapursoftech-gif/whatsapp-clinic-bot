@@ -12,7 +12,7 @@
 
 const sheets = require('./sheets');
 const records = require('./records');
-const { escapeHtml } = require('./ui');
+const { escapeHtml, sendUnauthorized } = require('./ui');
 
 function buildCasePaperHtml({
   clinicName,
@@ -284,7 +284,7 @@ function registerRoutes(app, ctx) {
   const { TRIGGER_SECRET, CLINIC_NAME_FALLBACK } = ctx;
 
   app.get('/case-paper', async (req, res) => {
-    if (req.query.secret !== TRIGGER_SECRET) return res.sendStatus(401);
+    if (req.query.secret !== TRIGGER_SECRET) return sendUnauthorized(res);
     const { phone, date, token } = req.query;
     if (!phone || !date || !token) {
       return res.status(400).send('phone, date and token query params are required.');
@@ -345,7 +345,7 @@ function registerRoutes(app, ctx) {
   });
 
   app.post('/case-paper/save', async (req, res) => {
-    if (req.query.secret !== TRIGGER_SECRET) return res.sendStatus(401);
+    if (req.query.secret !== TRIGGER_SECRET) return sendUnauthorized(res);
     const { bookingId } = req.query;
     if (!bookingId) return res.status(400).json({ error: 'This booking has no Booking ID (created before the upgrade) — nothing to save against.' });
 

@@ -98,4 +98,12 @@ ${extraHead}
 </html>`;
 }
 
-module.exports = { pageShell, escapeHtml, NAV_ITEMS };
+const UNAUTHORIZED_MESSAGE =
+  'Unauthorized (401): the ?secret=... in this URL does not match TRIGGER_SECRET on the server. ' +
+  'Check for a typo, extra space, or a stale link, then try again.';
+
+function sendUnauthorized(res) {
+  return res.status(401).send(UNAUTHORIZED_MESSAGE);
+}
+
+module.exports = { pageShell, escapeHtml, NAV_ITEMS, sendUnauthorized, UNAUTHORIZED_MESSAGE };
