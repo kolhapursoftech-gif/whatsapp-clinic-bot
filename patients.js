@@ -6,17 +6,20 @@
 const sheets = require('./sheets');
 const counters = require('./counters');
 
-// Guarantees a Patient ID exists for this phone number (generating one on
-// first booking) and returns it. Safe to call every time a booking is
-// finalized — it's a no-op if the patient already has one.
-async function ensurePatientId(phone) {
-  return sheets.ensurePatientId(phone, counters.nextPatientId);
+// Guarantees a Patient ID exists for THIS SPECIFIC PERSON — (phone, name),
+// not phone alone. One WhatsApp number is often shared by a whole family
+// booking for different members, and each member needs their own separate
+// Patient ID/file, not one shared profile. Safe to call every time a
+// booking is finalized — it's a no-op if this person already has one.
+async function ensurePatientId(phone, name) {
+  return sheets.ensurePatientId(phone, name, counters.nextPatientId);
 }
 
-// Bumps Total Visits + Last Visit Date on the Patients row. Call this once
-// per finalized (paid/free-confirmed) booking, not on every message.
-async function recordVisit(phone, visitDateStr) {
-  await sheets.incrementPatientVisitCount(phone, visitDateStr);
+// Bumps Total Visits + Last Visit Date for this specific family member.
+// Call this once per finalized (paid/free-confirmed) booking, not on
+// every message.
+async function recordVisit(phone, name, visitDateStr) {
+  await sheets.incrementPatientVisitCount(phone, name, visitDateStr);
 }
 
 async function search(query) {
@@ -31,8 +34,11 @@ async function getByPatientId(patientId) {
   return sheets.getPatientByPatientId(patientId);
 }
 
-async function getByPhone(phone) {
-  return sheets.getPatientFullProfile(phone);
+// Returns the specific family member's profile — pass name when you know
+// which one; omitting it falls back to the first Patients row for this
+// phone (fine for phone-wide things like language, not for medical info).
+async function getByPhone(phone, name) {
+  return name ? sheets.getPatientProfileByPhoneAndName(phone, name) : sheets.getPatientFullProfile(phone);
 }
 
 // Builds the "complete digital file" timeline for one patient: every

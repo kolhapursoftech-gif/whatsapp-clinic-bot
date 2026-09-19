@@ -201,6 +201,59 @@ async function findRowByColumn(tabName, matchColumn, matchValue) {
 }
 
 // Returns every row where `matchColumn` equals `matchValue`, as objects.
+// Finds a row matching TWO columns at once (used for Patients, where the
+// real identity is (Phone Number, Name) — the same WhatsApp number is
+// often shared by a whole family, and each family member must get their
+// own separate row/Patient ID, not be merged into one). Case-insensitive,
+// trimmed name comparison so "Sourabh" and "sourabh " still match the same
+// person. Mirrors upsertByColumn's merge behaviour otherwise.
+async function upsertByTwoColumns(tabName, colA, valueA, colB, valueB, fieldsObj) {
+  const { header, rows } = await readTab(tabName);
+  const idxA = header.indexOf(colA);
+  const idxB = header.indexOf(colB);
+  if (idxA === -1 || idxB === -1) {
+    throw new Error(`upsertByTwoColumns: column "${idxA === -1 ? colA : colB}" not found in "${tabName}" tab header row.`);
+  }
+  const normB = (valueB || '').trim().toLowerCase();
+
+  const existingIndex = rows.findIndex(
+    (r) => stripQuote(r[idxA]) === valueA && (r[idxB] || '').trim().toLowerCase() === normB
+  );
+  const isNew = existingIndex === -1;
+  const baseRow = isNew ? new Array(header.length).fill('') : [...rows[existingIndex]];
+  while (baseRow.length < header.length) baseRow.push('');
+
+  header.forEach((colName, i) => {
+    if (Object.prototype.hasOwnProperty.call(fieldsObj, colName)) {
+      const val = fieldsObj[colName];
+      if (val !== undefined) baseRow[i] = val === null ? '' : val;
+    }
+  });
+
+  if (isNew) {
+    await appendRow(tabName, baseRow);
+  } else {
+    await updateRow(tabName, existingIndex + 2, baseRow);
+  }
+  return { isNew, row: rowToObject(header, baseRow), header };
+}
+
+// Same idea as findRowByColumn, but matching two columns (see
+// upsertByTwoColumns above for why Patients needs this).
+async function findRowByTwoColumns(tabName, colA, valueA, colB, valueB) {
+  const { header, rows } = await readTab(tabName);
+  const idxA = header.indexOf(colA);
+  const idxB = header.indexOf(colB);
+  if (idxA === -1 || idxB === -1) return null;
+  const normB = (valueB || '').trim().toLowerCase();
+  const row = rows.find((r) => stripQuote(r[idxA]) === valueA && (r[idxB] || '').trim().toLowerCase() === normB);
+  return row ? rowToObject(header, row) : null;
+}
+
+// Every family member calling from the same WhatsApp number gets found
+// here — used to show "which of these patients is this booking for" type
+// views. Not used for identity matching (that's phone+name); this is for
+// listing.
 async function findAllRowsByColumn(tabName, matchColumn, matchValue) {
   const { header, rows } = await readTab(tabName);
   const matchIdx = header.indexOf(matchColumn);
@@ -232,13 +285,27 @@ async function createTab(tabName) {
 // `requiredHeaders` that aren't already present, immediately to the right
 // of the existing ones. Never touches existing headers or any data row.
 // Returns { added: [...] } — the headers that were actually written.
+//
+// IMPORTANT: new columns are anchored to the right-most header we
+// RECOGNIZE (i.e. one that's part of `requiredHeaders` and already exists
+// in the tab) — not to the tab's raw last-used-column. A tab can have a
+// stray "note"/comment cell sitting far to the right of the real headers
+// (e.g. an instructional note); anchoring off the physical last-used
+// column would push new headers out past that note, leaving a big blank
+// gap between the real data columns and the new ones.
 async function ensureHeaderColumns(tabName, requiredHeaders) {
   const { header } = await readTab(tabName);
   const missing = requiredHeaders.filter((h) => !header.includes(h));
   if (missing.length === 0) return { added: [] };
 
-  const startCol = header.length + 1;
-  const endCol = header.length + missing.length;
+  let anchorIndex = -1; // 0-indexed position of the right-most header we recognize
+  requiredHeaders.forEach((h) => {
+    const idx = header.indexOf(h);
+    if (idx > anchorIndex) anchorIndex = idx;
+  });
+  const startCol = anchorIndex + 2; // +1 to move past it, +1 for 1-indexing
+  const endCol = startCol + missing.length - 1;
+
   const sheets = await getSheetsClient();
   await sheets.spreadsheets.values.update({
     spreadsheetId: SHEET_ID,
@@ -415,10 +482,20 @@ async function upsertPatientProfile(phone, { name, age, lang, lastVisitDate }) {
   const sheets = await getSheetsClient();
   const { header, rows } = await readTab('Patients');
   const phoneIdx = header.indexOf('Phone Number');
+  const nameIdx = header.indexOf('Name');
 
   const newRow = [`'${phone}`, name || '', age || '', lang || '', lastVisitDate ? `'${lastVisitDate}` : ''];
+  const normName = (name || '').trim().toLowerCase();
 
-  const existingIndex = phoneIdx === -1 ? -1 : rows.findIndex((r) => stripQuote(r[phoneIdx]) === phone);
+  // Matched on (Phone Number, Name) — see ensurePatientId's comment above
+  // for why phone alone isn't enough (one WhatsApp number, several family
+  // members, each their own row).
+  const existingIndex =
+    phoneIdx === -1 || nameIdx === -1
+      ? -1
+      : rows.findIndex(
+          (r) => stripQuote(r[phoneIdx]) === phone && (r[nameIdx] || '').trim().toLowerCase() === normName
+        );
 
   if (existingIndex === -1) {
     await appendRow('Patients', newRow);
@@ -883,6 +960,13 @@ async function getPatientFullProfile(phone) {
   return findRowByColumn('Patients', 'Phone Number', phone);
 }
 
+// Use this (not getPatientFullProfile) whenever the medical/personal info
+// of ONE SPECIFIC family member matters (allergies, saved profile fields,
+// visit count) — several patients can share one phone number.
+async function getPatientProfileByPhoneAndName(phone, name) {
+  return findRowByTwoColumns('Patients', 'Phone Number', phone, 'Name', name);
+}
+
 async function getPatientByPatientId(patientId) {
   return findRowByColumn('Patients', 'Patient ID', patientId);
 }
@@ -893,13 +977,18 @@ async function getPatientByPatientId(patientId) {
 // counters.js here) to avoid a circular require between sheets.js and
 // counters.js, since counters.js itself calls getCounterValue/setCounterValue
 // above.
-async function ensurePatientId(phone, generateId) {
-  const existing = await getPatientFullProfile(phone);
+// Ensures THIS SPECIFIC PERSON (phone + name) has a Patient ID — not just
+// this phone number. A family sharing one WhatsApp number and booking for
+// different members must get a separate Patient ID/file per member, so
+// matching is on (Phone Number, Name), not phone alone.
+async function ensurePatientId(phone, name, generateId) {
+  const existing = await findRowByTwoColumns('Patients', 'Phone Number', phone, 'Name', name);
   if (existing && existing['Patient ID']) return existing['Patient ID'];
 
   const patientId = await generateId();
-  await upsertByColumn('Patients', 'Phone Number', phone, {
+  await upsertByTwoColumns('Patients', 'Phone Number', phone, 'Name', name, {
     'Phone Number': `'${phone}`,
+    Name: name,
     'Patient ID': patientId,
     'Created At': (existing && existing['Created At']) || new Date().toISOString(),
     'Updated At': new Date().toISOString(),
@@ -911,16 +1000,16 @@ async function ensurePatientId(phone, generateId) {
 // present in `fields` (exact header names as documented above). Used by
 // the patient self-service profile page and by staff editing from the
 // dashboard. Also bumps "Updated At".
-async function updatePatientExtendedProfile(phone, fields) {
+async function updatePatientExtendedProfile(phone, name, fields) {
   const payload = { ...fields, 'Updated At': new Date().toISOString() };
-  const { row } = await upsertByColumn('Patients', 'Phone Number', phone, payload);
+  const { row } = await upsertByTwoColumns('Patients', 'Phone Number', phone, 'Name', name, payload);
   return row;
 }
 
-async function incrementPatientVisitCount(phone, lastVisitDate) {
-  const existing = await getPatientFullProfile(phone);
+async function incrementPatientVisitCount(phone, name, lastVisitDate) {
+  const existing = await getPatientProfileByPhoneAndName(phone, name);
   const current = (existing && parseInt(existing['Total Visits'], 10)) || 0;
-  await upsertByColumn('Patients', 'Phone Number', phone, {
+  await upsertByTwoColumns('Patients', 'Phone Number', phone, 'Name', name, {
     'Total Visits': current + 1,
     'Last Visit Date': lastVisitDate ? `'${lastVisitDate}` : '',
     'Updated At': new Date().toISOString(),
@@ -932,8 +1021,8 @@ async function incrementPatientVisitCount(phone, lastVisitDate) {
 // crypto.randomBytes — sheets.js only stores/looks it up so the phone
 // number and Patient ID never appear in the URL.
 
-async function setProfileToken(phone, token, expiryIso) {
-  await upsertByColumn('Patients', 'Phone Number', phone, {
+async function setProfileToken(phone, name, token, expiryIso) {
+  await upsertByTwoColumns('Patients', 'Phone Number', phone, 'Name', name, {
     'Profile Token': token,
     'Profile Token Expiry': expiryIso || '',
   });
@@ -1106,7 +1195,9 @@ module.exports = {
   appendRow,
   updateRow,
   upsertByColumn,
+  upsertByTwoColumns,
   findRowByColumn,
+  findRowByTwoColumns,
   findAllRowsByColumn,
   deleteRowByColumn,
 
@@ -1121,6 +1212,7 @@ module.exports = {
 
   // extended patients
   getPatientFullProfile,
+  getPatientProfileByPhoneAndName,
   getPatientByPatientId,
   ensurePatientId,
   updatePatientExtendedProfile,

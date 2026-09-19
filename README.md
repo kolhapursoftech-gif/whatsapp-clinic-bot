@@ -223,6 +223,28 @@ PROFILE_LINK_VALID_DAYS     — optional, defaults to 30. How long a patient's
 
 ## 7. Summary of What Changed in Existing Features
 
+- **Multiple patients per phone number** — a family sharing one WhatsApp
+  number and booking for different members now gets a **separate Patient
+  ID/file per member**, matched on (Phone Number, Name) instead of phone
+  alone. This touches `ensurePatientId`, `upsertPatientProfile`, the
+  extended-profile functions (`getPatientProfileByPhoneAndName`,
+  `updatePatientExtendedProfile`, `incrementPatientVisitCount`,
+  `setProfileToken`), and their callers in `patients.js`, `records.js`,
+  `profile.js`, and `finalizeBooking()`. The phone-only lookup
+  (`getPatientProfile`/`getPatientFullProfile`) is kept ONLY for things
+  that are genuinely phone-wide, not person-specific (preferred language,
+  "is this a returning number" greeting check).
+- **Profile link sent once per patient** — `finalizeBooking()` now checks
+  whether this specific family member's `Profile Completed` is already
+  `Yes` before generating/sending a new secure link. A second, third, etc.
+  booking for someone who already filled it in no longer gets pinged
+  again.
+- **Case paper page now has the staff nav bar** — the same
+  Dashboard/Appointments/Patients/Live Queue links shown on the dashboard
+  pages now appear at the top of the case paper too (hidden when printing),
+  so staff aren't dropped on a dead-end page after opening it from
+  WhatsApp.
+
 - **`finalizeBooking()`** (in `server.js`) — same booking-confirmed message
   and staff notification as before, PLUS: assigns/reuses a Patient ID,
   generates a Booking ID, records the Fee amount, creates today's Queue

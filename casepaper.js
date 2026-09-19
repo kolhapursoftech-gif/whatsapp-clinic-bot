@@ -12,7 +12,7 @@
 
 const sheets = require('./sheets');
 const records = require('./records');
-const { escapeHtml, sendUnauthorized } = require('./ui');
+const { escapeHtml, sendUnauthorized, NAV_ITEMS } = require('./ui');
 
 function buildCasePaperHtml({
   clinicName,
@@ -148,9 +148,19 @@ function buildCasePaperHtml({
     body { padding: 0; background: #fff; }
     .sheet { box-shadow: none; border-radius: 0; padding: 0; max-width: 100%; }
   }
+  .staff-nav { max-width: 840px; margin: 0 auto 14px; display: flex; gap: 6px; flex-wrap: wrap; }
+  .staff-nav a { font-size: 12.5px; font-weight: 600; color: #14532d; text-decoration: none; padding: 7px 14px; border: 1.5px solid #14532d; border-radius: 8px; background: #fff; }
+  .staff-nav a:hover { background: #14532d; color: #fff; }
+  .staff-nav a.active { background: #d4a94f; border-color: #d4a94f; color: #4a3200; }
 </style>
 </head>
 <body>
+<div class="staff-nav no-print">
+  ${NAV_ITEMS.map(
+    (item) =>
+      `<a href="${item.path}?secret=${encodeURIComponent(secret || '')}">${item.label}</a>`
+  ).join('')}
+</div>
 <div class="sheet">
 
   <div class="header">
@@ -307,7 +317,7 @@ function registerRoutes(app, ctx) {
         casePaperNumber = await records.ensureCasePaperNumber(booking);
       }
 
-      const history = await records.getHistoryForCasePaper(String(phone), patientId);
+      const history = await records.getHistoryForCasePaper(String(phone), booking.Name, patientId);
       const existingRecord = booking['Booking ID'] ? await sheets.getRecordByBookingId(booking['Booking ID']) : null;
 
       const saveUrl = `/case-paper/save?${new URLSearchParams({

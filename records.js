@@ -69,10 +69,12 @@ async function getRecordForBooking(bookingId) {
 
 // Everything the case paper needs about this patient's PAST visits:
 // previous record summaries + the standing medical info (allergies,
-// history, current medicines) from their extended profile.
-async function getHistoryForCasePaper(phone, patientId) {
+// history, current medicines) from their extended profile. Looked up by
+// (phone, name) — not phone alone — so a family member's allergies never
+// bleed into another family member's case paper.
+async function getHistoryForCasePaper(phone, name, patientId) {
   const [profile, records] = await Promise.all([
-    sheets.getPatientFullProfile(phone),
+    sheets.getPatientProfileByPhoneAndName(phone, name),
     patientId ? sheets.getRecordsForPatient(patientId) : Promise.resolve([]),
   ]);
 

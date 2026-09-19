@@ -22,11 +22,14 @@ function generateToken() {
 }
 
 // Call this once when a booking is confirmed. Returns the full URL to send
-// the patient over WhatsApp.
-async function createProfileLink(phone, appBaseUrl) {
+// the patient over WhatsApp. Scoped to (phone, name) — see
+// ensurePatientId's comment in sheets.js for why: a shared family WhatsApp
+// number needs a separate token per family member, each landing on THEIR
+// OWN profile, never someone else's.
+async function createProfileLink(phone, name, appBaseUrl) {
   const token = generateToken();
   const expiry = new Date(Date.now() + TOKEN_VALID_DAYS * 24 * 60 * 60 * 1000).toISOString();
-  await sheets.setProfileToken(phone, token, expiry);
+  await sheets.setProfileToken(phone, name, token, expiry);
   return `${appBaseUrl}/patient-profile/${token}`;
 }
 
@@ -148,9 +151,13 @@ function registerRoutes(app, ctx) {
         return res.status(410).send('Ha link ata valid nahi. Kripaya clinic la sampark sadha.');
       }
       const phone = sheets.stripQuote(patient['Phone Number']);
+      const originalName = patient['Name']; // match key — see note below
       const b = req.body || {};
 
-      await sheets.updatePatientExtendedProfile(phone, {
+      // Matched by (phone, ORIGINAL name) so if the patient corrects a typo
+      // in their name here, it updates their existing row instead of
+      // accidentally creating a second, orphaned patient record.
+      await sheets.updatePatientExtendedProfile(phone, originalName, {
         Name: b.fullName || patient['Name'],
         Age: b.age || patient['Age'],
         'Date of Birth': b.dob || '',

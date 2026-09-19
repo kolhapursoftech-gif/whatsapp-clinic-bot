@@ -232,8 +232,9 @@ async function finalizeBooking(phone, name, age, reason, dateStr, slot, token, o
   const feeAmount =
     opts.paymentStatus === 'Free' ? 0 : parseInt(visitType === 'Follow-up' ? settings.followUpFee : settings.newPatientFee, 10) || 0;
 
-  // --- New: Patient ID + Appointment (Booking) ID, generated once per booking ---
-  const patientId = await patientsDomain.ensurePatientId(phone);
+  // --- Patient ID is per (phone, name) — a shared family WhatsApp number
+  // gets one Patient ID per family member, not one shared profile ---
+  const patientId = await patientsDomain.ensurePatientId(phone, name);
   const bookingId = await counters.nextAppointmentId();
 
   // Writes ALL columns (old + new) on one row, by header name — see
@@ -261,7 +262,7 @@ async function finalizeBooking(phone, name, age, reason, dateStr, slot, token, o
   });
 
   await sheets.upsertPatientProfile(phone, { name, age, lang: opts.lang, lastVisitDate: dateStr });
-  await patientsDomain.recordVisit(phone, dateStr);
+  await patientsDomain.recordVisit(phone, name, dateStr);
   await sheets.clearPendingState(phone);
 
   // --- New: create today's live-queue entry for this token ---
@@ -277,11 +278,18 @@ async function finalizeBooking(phone, name, age, reason, dateStr, slot, token, o
     M.bookingConfirmed(opts.clinicName || CLINIC_NAME_FALLBACK, name, token, dateStr, slot)
   );
 
-  // --- New: secure patient-profile completion link ---
+  // --- Secure patient-profile completion link — sent ONCE per patient.
+  // If this specific family member has already completed their profile
+  // (checked by phone+name, same identity as everywhere else above), don't
+  // resend the link on every subsequent booking.
   if (APP_BASE_URL) {
     try {
-      const profileLink = await profileModule.createProfileLink(phone, APP_BASE_URL);
-      await whatsapp.sendText(phone, M.profileLinkMessage(profileLink));
+      const existingProfile = await sheets.getPatientProfileByPhoneAndName(phone, name);
+      const alreadyCompleted = existingProfile && existingProfile['Profile Completed'] === 'Yes';
+      if (!alreadyCompleted) {
+        const profileLink = await profileModule.createProfileLink(phone, name, APP_BASE_URL);
+        await whatsapp.sendText(phone, M.profileLinkMessage(profileLink));
+      }
     } catch (err) {
       console.error('profile link error (non-fatal):', err.message);
     }
