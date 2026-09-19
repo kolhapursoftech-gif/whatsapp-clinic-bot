@@ -2,6 +2,7 @@
 require('dotenv').config();
 
 const express = require('express');
+const axios = require('axios');
 const whatsapp = require('./whatsapp');
 const sheets = require('./sheets');
 const { getMessages, LANGUAGE_BUTTONS, languagePrompt, SAME_PATIENT_BUTTONS } = require('./messages');
@@ -15,6 +16,7 @@ const queueModule = require('./queue');
 const filesModule = require('./files');
 const dashboardModule = require('./dashboard');
 const casepaperModule = require('./casepaper');
+const schema = require('./schema');
 const { sendUnauthorized } = require('./ui');
 
 const app = express();
@@ -22,6 +24,12 @@ app.use(express.json());
 // Needed for the patient-profile page, which is a plain HTML <form method="POST">
 // (no JS framework) — those submit as application/x-www-form-urlencoded.
 app.use(express.urlencoded({ extended: true }));
+
+// Lightweight, unauthenticated health-check — used by our own self-ping
+// below (Render free-tier keep-alive) and safe to hit from any uptime
+// monitor too. Does not touch Google Sheets/Drive, so it never eats into
+// API quota.
+app.get('/ping', (req, res) => res.status(200).send('OK'));
 
 const CLINIC_NAME_FALLBACK = process.env.CLINIC_NAME || 'the clinic';
 const DOCTOR_NUMBER = process.env.DOCTOR_WHATSAPP_NUMBER; // fallback if Settings tab has none
@@ -359,6 +367,58 @@ app.get('/admin/generate-slots', async (req, res) => {
   } catch (err) {
     console.error('generate-slots error:', err.message);
     res.status(500).send('Error: ' + err.message);
+  }
+});
+
+// Re-runs schema.js's tab/column auto-setup on demand — useful right after
+// deploying new code that added a new column to schema.js, without waiting
+// for the next server restart. Safe to call any time (see schema.js).
+app.get('/admin/ensure-schema', async (req, res) => {
+  if (req.query.secret !== TRIGGER_SECRET) {
+    return sendUnauthorized(res);
+  }
+  try {
+    const report = await schema.ensureSheetSchema();
+    res.json(report);
+  } catch (err) {
+    console.error('ensure-schema error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------- Debug: what does the server ACTUALLY see in Bookings? ----------
+// Visit /admin/debug-bookings?secret=... — returns plain JSON, no Google
+// login needed, nothing guessed from a screenshot. Shows exactly what
+// getBookingsForDate() sees, so date-matching issues are visible in one
+// look instead of a round trip of screenshots.
+app.get('/admin/debug-bookings', async (req, res) => {
+  if (req.query.secret !== TRIGGER_SECRET) {
+    return sendUnauthorized(res);
+  }
+  try {
+    const todayComputed = req.query.date || istDateString(0);
+    const { header, rows } = await sheets.readTab('Bookings');
+    const dateIdx = header.indexOf('Date');
+
+    const allRows = rows.map((r, i) => ({
+      sheetRow: i + 2,
+      Date_raw: r[dateIdx],
+      Date_stripped: dateIdx !== -1 ? sheets.stripQuote(r[dateIdx]).trim() : null,
+      Name: r[header.indexOf('Name')],
+      Token: r[header.indexOf('Token Number')],
+      matchesToday: dateIdx !== -1 && sheets.stripQuote(r[dateIdx]).trim() === todayComputed.trim(),
+    }));
+
+    res.json({
+      serverComputedToday: todayComputed,
+      totalRowsInSheet: rows.length,
+      header,
+      rowsMatchingToday: allRows.filter((r) => r.matchesToday).length,
+      last10Rows: allRows.slice(-10),
+    });
+  } catch (err) {
+    console.error('debug-bookings error:', err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -831,6 +891,67 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`WhatsApp clinic bot listening on port ${PORT}`);
+
+  // ---------- Auto-create/extend the Google Sheet structure ----------
+  // Every tab/column the app needs is defined once in schema.js. This
+  // creates whatever is missing (new tabs, new columns on existing tabs,
+  // default Settings) every time the server starts — so shipping a new
+  // feature that needs a new column is just: add it to schema.js, deploy,
+  // done. Nothing here is ever destructive (see schema.js's header comment
+  // for the exact rules) — safe to run on every single startup.
+  schema
+    .ensureSheetSchema()
+    .then((report) => {
+      if (report.tabsCreated.length) console.log('[schema] Created new tabs:', report.tabsCreated.join(', '));
+      if (Object.keys(report.columnsAdded).length) console.log('[schema] Added columns:', JSON.stringify(report.columnsAdded));
+      if (report.settingsAdded.length) console.log('[schema] Added default Settings:', report.settingsAdded.join(', '));
+      if (!report.tabsCreated.length && !Object.keys(report.columnsAdded).length && !report.settingsAdded.length) {
+        console.log('[schema] Sheet already matches schema.js — nothing to add.');
+      }
+    })
+    .catch((err) => console.error('[schema] ensureSheetSchema failed:', err.message));
+
+  // ---------- Automatic daily slot generation ----------
+  // generateUpcomingSlots() was previously only reachable by manually
+  // visiting /admin/generate-slots — if nobody opened that link on a given
+  // day, the Capacity tab stopped growing and slots silently ran out.
+  // Now it also runs once at startup and then every 24 hours for as long
+  // as this process stays alive.
+  //
+  // CAVEAT (Render free tier): a free web service "sleeps" after ~15 min
+  // with no incoming traffic, which pauses this timer too. The self-ping
+  // block right below keeps it awake without needing any external service.
+  function runSlotGeneration(trigger) {
+    sheets
+      .generateUpcomingSlots()
+      .then((summary) =>
+        console.log(`[${trigger}] generateUpcomingSlots: added ${summary.added} new slot rows (daysAhead=${summary.daysAhead}, slotsPerDay=${summary.slotsPerDay})`)
+      )
+      .catch((err) => console.error(`[${trigger}] generateUpcomingSlots failed:`, err.message));
+  }
+  // Give the schema a moment to finish creating tabs before slot generation
+  // (which reads Settings/Capacity) runs against them.
+  setTimeout(() => runSlotGeneration('startup'), 5000);
+  setInterval(() => runSlotGeneration('daily-timer'), 24 * 60 * 60 * 1000);
+
+  // ---------- Self-ping keep-alive (Render free-tier workaround) ----------
+  // Render's free web services sleep after ~15 minutes with no INCOMING
+  // request, which also pauses every setInterval above. Hitting our own
+  // public /ping URL every 10 minutes is itself an incoming request from
+  // Render's point of view, so it resets that idle timer — no external
+  // cron service, no paid plan, nothing to sign up for.
+  // Honest caveat: this is a widely-used workaround, not an official
+  // Render guarantee. If you move to a paid Render plan (which doesn't
+  // sleep), this block is harmless and simply becomes a no-op.
+  if (APP_BASE_URL) {
+    setInterval(() => {
+      axios.get(`${APP_BASE_URL}/ping`, { timeout: 10000 }).catch((err) => {
+        console.warn('self-ping failed (non-fatal):', err.message);
+      });
+    }, 10 * 60 * 1000);
+  } else {
+    console.warn('APP_BASE_URL not set — self-ping keep-alive disabled (service may sleep on Render free tier).');
+  }
 
   // Publish the dashboard link into the Settings tab so the clinic can just
   // open the Sheet and copy it, instead of building the URL by hand.

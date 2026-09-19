@@ -87,15 +87,62 @@ function colLetter(n) {
   return s;
 }
 
+// Per-tab lock so two near-simultaneous appends to the SAME tab can never
+// compute the same "next row" and overwrite each other — see appendRow()
+// below for why this is needed instead of the Sheets API's own append.
+const appendLocks = new Map();
+function withAppendLock(key, fn) {
+  const previous = appendLocks.get(key) || Promise.resolve();
+  const run = previous.then(fn, fn);
+  const settled = run.then(
+    () => { if (appendLocks.get(key) === settled) appendLocks.delete(key); },
+    () => { if (appendLocks.get(key) === settled) appendLocks.delete(key); }
+  );
+  appendLocks.set(key, settled);
+  return run;
+}
+
+// Appends a row by EXPLICITLY computing the next empty row (current real
+// row count + 2) and writing there with values.update — deliberately NOT
+// using the Sheets API's own values.append/INSERT_ROWS.
+//
+// Why: values.append decides where to write based on the sheet's overall
+// "used range" (what Ctrl+End jumps to), which can include cells that were
+// only ever formatted (borders/column widths/etc, e.g. left over from an
+// xlsx import) and never actually held data. When that phantom used-range
+// extends far below the real data — we've seen it land 1000+ rows down —
+// append() writes new rows way out there instead of right after the real
+// data, while every READ (readTab, which only sees actual values) keeps
+// reporting the tab as empty. Writes and reads disagreeing like that is
+// exactly what caused bookings to "vanish". Computing the row ourselves
+// from readTab's own row count keeps writes and reads looking at the same
+// reality.
 async function appendRow(tabName, values) {
-  const sheets = await getSheetsClient();
-  const endCol = colLetter(values.length);
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: SHEET_ID,
-    range: `${tabName}!A:${endCol}`,
-    valueInputOption: 'USER_ENTERED',
-    insertDataOption: 'INSERT_ROWS',
-    requestBody: { values: [values] },
+  return withAppendLock(tabName, async () => {
+    const { rows } = await readTab(tabName);
+    const targetRow = rows.length + 2; // +1 for header, +1 for 1-indexing
+    await updateRow(tabName, targetRow, values);
+  });
+}
+
+// Same idea as appendRow, but for writing several rows in one shot (e.g.
+// a week's worth of newly-generated slots) — still lock-guarded and still
+// computed from the real row count, not the Sheets API's own append.
+async function appendRows(tabName, rowsOfValues) {
+  if (!rowsOfValues || rowsOfValues.length === 0) return;
+  return withAppendLock(tabName, async () => {
+    const { rows } = await readTab(tabName);
+    const startRow = rows.length + 2;
+    const maxLen = Math.max(...rowsOfValues.map((r) => r.length));
+    const endCol = colLetter(maxLen);
+    const endRow = startRow + rowsOfValues.length - 1;
+    const sheets = await getSheetsClient();
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SHEET_ID,
+      range: `${tabName}!A${startRow}:${endCol}${endRow}`,
+      valueInputOption: 'USER_ENTERED',
+      requestBody: { values: rowsOfValues },
+    });
   });
 }
 
@@ -159,6 +206,47 @@ async function findAllRowsByColumn(tabName, matchColumn, matchValue) {
   const matchIdx = header.indexOf(matchColumn);
   if (matchIdx === -1) return [];
   return rows.filter((r) => stripQuote(r[matchIdx]) === matchValue).map((r) => rowToObject(header, r));
+}
+
+// ---------- Schema management (auto-create tabs/columns) ----------
+// Used by schema.js so the app can set up and extend its own Google Sheet
+// structure — no more manually adding columns/tabs by hand every time a
+// feature needs a new one.
+
+async function listTabNames() {
+  const sheets = await getSheetsClient();
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: SHEET_ID });
+  return (meta.data.sheets || []).map((s) => s.properties.title);
+}
+
+async function createTab(tabName) {
+  const sheets = await getSheetsClient();
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: SHEET_ID,
+    requestBody: { requests: [{ addSheet: { properties: { title: tabName } } }] },
+  });
+  sheetIdCache = null; // stale now that a new tab exists — refetch next time it's needed
+}
+
+// Reads a tab's current header row (row 1) and writes any headers from
+// `requiredHeaders` that aren't already present, immediately to the right
+// of the existing ones. Never touches existing headers or any data row.
+// Returns { added: [...] } — the headers that were actually written.
+async function ensureHeaderColumns(tabName, requiredHeaders) {
+  const { header } = await readTab(tabName);
+  const missing = requiredHeaders.filter((h) => !header.includes(h));
+  if (missing.length === 0) return { added: [] };
+
+  const startCol = header.length + 1;
+  const endCol = header.length + missing.length;
+  const sheets = await getSheetsClient();
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SHEET_ID,
+    range: `${tabName}!${colLetter(startCol)}1:${colLetter(endCol)}1`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: [missing] },
+  });
+  return { added: missing };
 }
 
 // Cache of tab title -> numeric sheetId (grid id), needed for row deletion
@@ -274,12 +362,10 @@ async function setSettingValue(key, value) {
 
   const existingIndex = rows.findIndex((r) => (r[0] || '').trim() === key);
   if (existingIndex === -1) {
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: SHEET_ID,
-      range: 'Settings!A:B',
-      valueInputOption: 'USER_ENTERED',
-      insertDataOption: 'INSERT_ROWS',
-      requestBody: { values: [[key, value]] },
+    await withAppendLock('Settings', async () => {
+      const { rows: freshRows } = await readTab('Settings');
+      const targetRow = freshRows.length + 2;
+      await updateRow('Settings', targetRow, [key, value]);
     });
   } else {
     const sheetRowNumber = existingIndex + 2; // +1 header, +1 for 1-indexing
@@ -335,13 +421,7 @@ async function upsertPatientProfile(phone, { name, age, lang, lastVisitDate }) {
   const existingIndex = phoneIdx === -1 ? -1 : rows.findIndex((r) => stripQuote(r[phoneIdx]) === phone);
 
   if (existingIndex === -1) {
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: SHEET_ID,
-      range: 'Patients!A:E',
-      valueInputOption: 'USER_ENTERED',
-      insertDataOption: 'INSERT_ROWS',
-      requestBody: { values: [newRow] },
-    });
+    await appendRow('Patients', newRow);
   } else {
     const sheetRowNumber = existingIndex + 2;
     await sheets.spreadsheets.values.update({
@@ -575,14 +655,7 @@ async function generateUpcomingSlots() {
   }
 
   if (newRows.length > 0) {
-    const sheets = await getSheetsClient();
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: SHEET_ID,
-      range: 'Capacity!A:D',
-      valueInputOption: 'USER_ENTERED',
-      insertDataOption: 'INSERT_ROWS',
-      requestBody: { values: newRows },
-    });
+    await appendRows('Capacity', newRows);
   }
 
   return { daysAhead, slotsPerDay: dailySlots.length, added: newRows.length };
@@ -591,7 +664,6 @@ async function generateUpcomingSlots() {
 // ---------- Bookings ----------
 
 async function appendBooking({ name, age, reason, date, slot, token, phone, paymentStatus, visitType }) {
-  const sheets = await getSheetsClient();
   // Column order here MUST match the actual Bookings tab:
   // Timestamp | Phone Number | Name | Age | Reason | Date | Slot | Token Number | Payment Status | Visit Type
   //
@@ -599,28 +671,18 @@ async function appendBooking({ name, age, reason, date, slot, token, phone, paym
   // phone numbers) to STOP Google Sheets from auto-converting "2026-09-05"
   // into a real Date type (which then displays as a serial number like
   // 46270 and can never text-match what the bot compares against).
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: SHEET_ID,
-    range: 'Bookings!A:J',
-    valueInputOption: 'USER_ENTERED',
-    insertDataOption: 'INSERT_ROWS',
-    requestBody: {
-      values: [
-        [
-          new Date().toISOString(),
-          `'${phone}`,
-          name,
-          age,
-          reason || '',
-          `'${date}`,
-          `'${slot}`,
-          token,
-          paymentStatus || 'Paid',
-          visitType || '',
-        ],
-      ],
-    },
-  });
+  await appendRow('Bookings', [
+    new Date().toISOString(),
+    `'${phone}`,
+    name,
+    age,
+    reason || '',
+    `'${date}`,
+    `'${slot}`,
+    token,
+    paymentStatus || 'Paid',
+    visitType || '',
+  ]);
 }
 
 // ---------- Pending conversation state ----------
@@ -649,7 +711,6 @@ async function getPendingState(phone) {
 // Upserts a row for this phone number. Simple linear scan + update-by-range;
 // fine at clinic scale (a handful of concurrent conversations at most).
 async function setPendingState(phone, data) {
-  const sheets = await getSheetsClient();
   const { header, rows } = await readTab('Pending');
   const phoneIdx = header.indexOf('Phone Number');
 
@@ -668,16 +729,11 @@ async function setPendingState(phone, data) {
   const existingIndex = phoneIdx === -1 ? -1 : rows.findIndex((r) => stripQuote(r[phoneIdx]) === phone);
 
   if (existingIndex === -1) {
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: SHEET_ID,
-      range: 'Pending!A:I',
-      valueInputOption: 'USER_ENTERED',
-      insertDataOption: 'INSERT_ROWS',
-      requestBody: { values: [newRow] },
-    });
+    await appendRow('Pending', newRow);
   } else {
     // +2 = +1 for header row, +1 because Sheets ranges are 1-indexed
     const sheetRowNumber = existingIndex + 2;
+    const sheets = await getSheetsClient();
     await sheets.spreadsheets.values.update({
       spreadsheetId: SHEET_ID,
       range: `Pending!A${sheetRowNumber}:I${sheetRowNumber}`,
@@ -1046,12 +1102,18 @@ module.exports = {
   readTab,
   rowToObject,
   stripQuote,
+  colLetter,
   appendRow,
   updateRow,
   upsertByColumn,
   findRowByColumn,
   findAllRowsByColumn,
   deleteRowByColumn,
+
+  // schema management (used by schema.js)
+  listTabNames,
+  createTab,
+  ensureHeaderColumns,
 
   // counters
   getCounterValue,

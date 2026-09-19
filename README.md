@@ -8,6 +8,28 @@ with the smallest possible edits (see Section 7).
 
 ---
 
+## 0. The Sheet now builds/updates itself — schema.js
+
+You no longer need to manually add tabs or columns to the Google Sheet.
+`schema.js` is the single source of truth for every tab and column the app
+needs. Every time the server starts, it automatically:
+
+- Creates any tab listed in `schema.js` that doesn't exist yet
+- Adds any column listed that a tab is missing (always to the right of
+  what's already there — existing columns/data are never touched)
+- Adds default rows to `Settings` for any key that isn't there yet
+
+**Adding a future feature that needs a new column or tab:** add it to the
+`TAB_SCHEMAS` (or `SETTINGS_DEFAULTS`) list in `schema.js`, deploy, and
+it's created automatically — no manual spreadsheet editing, ever.
+
+To apply a schema change immediately without waiting for a restart, visit:
+`https://your-app.onrender.com/admin/ensure-schema?secret=YOUR_SECRET`
+— it returns a JSON summary of what it created/added (empty lists if the
+sheet already matches). Safe to call any number of times.
+
+---
+
 ## 1. Updated Project File Structure
 
 ```
@@ -38,6 +60,9 @@ whatsapp-clinic-bot/
 └── ui.js               (NEW) — shared HTML shell / nav / design tokens used
                           by dashboard.js, queue.js (keeps the new pages
                           visually consistent with each other)
+└── schema.js           (NEW) — single source of truth for every tab/column
+                          the app needs; auto-creates/extends the live
+                          Google Sheet to match on every server startup
 ```
 
 ---
@@ -55,6 +80,7 @@ whatsapp-clinic-bot/
 | `dashboard.js` | Three pages: `/dashboard/home` (today's stats + snapshots), `/patients` (searchable list), `/patients/:patientId` (complete digital file: personal info, medical info, timeline, files). |
 | `casepaper.js` | Everything the old inline `/case-paper` route did, PLUS: Case Paper Number badge, a patient-history panel (allergies/history/current medicines/last 5 diagnoses), and a "Save Diagnosis & Prescription" button (`POST /case-paper/save`) that actually persists into `Records` instead of only living in the browser tab. |
 | `ui.js` | One shared HTML page shell (nav bar + CSS variables) so `dashboard.js` and `queue.js` look like one product. `profile.js` and `casepaper.js` use their own standalone shells on purpose (they're patient-facing / print-facing pages, not staff nav pages). |
+| `schema.js` | Defines every tab/column the app needs and auto-creates/extends the live Sheet to match — see Section 0 above. |
 
 ---
 
