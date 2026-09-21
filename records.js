@@ -34,7 +34,7 @@ async function ensureCasePaperNumber(booking) {
 // ONE Record row per booking (calling it again for the same booking
 // overwrites — matched by Booking ID — rather than creating duplicates,
 // since a doctor may reopen and edit a case paper before printing).
-async function saveDiagnosis({ booking, patientId, doctorName, diagnosis, notes, medicines }) {
+async function saveDiagnosis({ booking, patientId, doctorId, doctorName, diagnosis, notes, medicines }) {
   const existing = await sheets.getRecordByBookingId(booking['Booking ID']);
   const recordId = (existing && existing['Record ID']) || (await counters.nextRecordId());
   const prescriptionId =
@@ -47,6 +47,7 @@ async function saveDiagnosis({ booking, patientId, doctorName, diagnosis, notes,
     'Booking ID': booking['Booking ID'],
     'Case Paper Number': booking['Case Paper Number'] || '',
     Date: sheets.stripQuote(booking.Date),
+    'Doctor ID': doctorId || '',
     'Doctor Name': doctorName || '',
     Reason: booking.Reason || '',
     Diagnosis: diagnosis || '',
@@ -58,7 +59,10 @@ async function saveDiagnosis({ booking, patientId, doctorName, diagnosis, notes,
 
   // upsertByColumn keyed on Record ID keeps this idempotent on repeat saves.
   await sheets.upsertByColumn('Records', 'Record ID', recordId, fields);
-  await sheets.updateBookingByBookingId(booking['Booking ID'], { 'Booking Status': 'Consulted' });
+  await sheets.updateBookingByBookingId(booking['Booking ID'], {
+    'Booking Status': 'Consulted',
+    'Doctor ID': doctorId || booking['Doctor ID'] || '',
+  });
 
   return { recordId, prescriptionId };
 }

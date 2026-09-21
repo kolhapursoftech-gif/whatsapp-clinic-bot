@@ -10,6 +10,7 @@
 // "NEXT" = the next few Waiting/Checked-In entries in token order.
 
 const sheets = require('./sheets');
+const staff = require('./staff');
 const whatsapp = require('./whatsapp');
 const { getMessages } = require('./messages');
 const { pageShell, escapeHtml, sendUnauthorized } = require('./ui');
@@ -172,7 +173,7 @@ function registerRoutes(app, ctx) {
   }
 
   app.get('/queue', async (req, res) => {
-    if (req.query.secret !== TRIGGER_SECRET) return sendUnauthorized(res);
+    if (!staff.isAuthorized(req, TRIGGER_SECRET)) return sendUnauthorized(res);
     try {
       const settings = await sheets.getSettings();
       const dateStr = req.query.date || istDateString(0);
@@ -202,7 +203,7 @@ function registerRoutes(app, ctx) {
   });
 
   app.post('/queue/:bookingId/action', async (req, res) => {
-    if (req.query.secret !== TRIGGER_SECRET) return sendUnauthorized(res);
+    if (!staff.isAuthorized(req, TRIGGER_SECRET)) return sendUnauthorized(res);
     const { bookingId } = req.params;
     const { action, date } = req.query;
     try {

@@ -11,7 +11,9 @@
 // the Records tab (records.js) instead of only living in the browser.
 
 const sheets = require('./sheets');
+const staff = require('./staff');
 const records = require('./records');
+const doctorsModule = require('./doctors');
 const { escapeHtml, sendUnauthorized, NAV_ITEMS } = require('./ui');
 
 function buildCasePaperHtml({
@@ -33,6 +35,7 @@ function buildCasePaperHtml({
   existingRecord,
   saveUrl,
   secret,
+  doctors = [],
 }) {
   const savedItems = existingRecord && existingRecord['Prescription Items'];
   let prefillMedicines = [];
@@ -185,6 +188,21 @@ function buildCasePaperHtml({
   ${historyHtml}
 
   <div class="diag-box no-print">
+    ${
+      doctors && doctors.length
+        ? `<label>Seen By (Doctor)</label>
+    <select id="doctorSelect">
+      ${doctors
+        .map(
+          (d) =>
+            `<option value="${escapeHtml(d.id)}" ${
+              (existingRecord && existingRecord['Doctor ID']) === d.id ? 'selected' : ''
+            }>${escapeHtml(d.name)}</option>`
+        )
+        .join('')}
+    </select>`
+        : ''
+    }
     <label>Diagnosis</label>
     <textarea id="diagnosisInput" rows="2" placeholder="Doctor's diagnosis...">${escapeHtml(
       existingRecord ? existingRecord.Diagnosis : ''
@@ -268,6 +286,7 @@ function buildCasePaperHtml({
 
     statusEl.textContent = 'Saving...';
     try {
+      const doctorSelectEl = document.getElementById('doctorSelect');
       const res = await fetch(${JSON.stringify(saveUrl)}, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -275,6 +294,7 @@ function buildCasePaperHtml({
           diagnosis: document.getElementById('diagnosisInput').value,
           notes: document.getElementById('notesInput').value,
           medicines,
+          doctorId: doctorSelectEl ? doctorSelectEl.value : '',
         }),
       });
       if (!res.ok) throw new Error('Save failed (' + res.status + ')');
@@ -294,7 +314,7 @@ function registerRoutes(app, ctx) {
   const { TRIGGER_SECRET, CLINIC_NAME_FALLBACK } = ctx;
 
   app.get('/case-paper', async (req, res) => {
-    if (req.query.secret !== TRIGGER_SECRET) return sendUnauthorized(res);
+    if (!staff.isAuthorized(req, TRIGGER_SECRET)) return sendUnauthorized(res);
     const { phone, date, token } = req.query;
     if (!phone || !date || !token) {
       return res.status(400).send('phone, date and token query params are required.');
@@ -307,6 +327,7 @@ function registerRoutes(app, ctx) {
         return res.status(404).send('No matching booking found. Double-check the phone, date and token in the link.');
       }
       const medicines = await sheets.getMedicineDatabase();
+      const doctors = await doctorsModule.listActiveDoctors();
 
       let casePaperNumber = booking['Case Paper Number'];
       const patientId = booking['Patient ID'];
@@ -344,6 +365,7 @@ function registerRoutes(app, ctx) {
         existingRecord,
         saveUrl,
         secret: TRIGGER_SECRET,
+        doctors,
       });
 
       res.set('Content-Type', 'text/html');
@@ -355,7 +377,7 @@ function registerRoutes(app, ctx) {
   });
 
   app.post('/case-paper/save', async (req, res) => {
-    if (req.query.secret !== TRIGGER_SECRET) return sendUnauthorized(res);
+    if (!staff.isAuthorized(req, TRIGGER_SECRET)) return sendUnauthorized(res);
     const { bookingId } = req.query;
     if (!bookingId) return res.status(400).json({ error: 'This booking has no Booking ID (created before the upgrade) — nothing to save against.' });
 
@@ -364,11 +386,20 @@ function registerRoutes(app, ctx) {
       if (!booking) return res.status(404).json({ error: 'Booking not found.' });
 
       const settings = await sheets.getSettings();
-      const { diagnosis, notes, medicines } = req.body || {};
+      const { diagnosis, notes, medicines, doctorId } = req.body || {};
+
+      let doctorName = settings.doctorName;
+      if (doctorId) {
+        const doctors = await doctorsModule.listActiveDoctors();
+        const matched = doctors.find((d) => d.id === doctorId);
+        if (matched) doctorName = matched.name;
+      }
+
       const result = await records.saveDiagnosis({
         booking,
         patientId: booking['Patient ID'],
-        doctorName: settings.doctorName,
+        doctorId: doctorId || '',
+        doctorName,
         diagnosis,
         notes,
         medicines,

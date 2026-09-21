@@ -22,6 +22,7 @@ const NAV_ITEMS = [
   { key: 'appointments', label: '📅 Appointments', path: '/dashboard' },
   { key: 'patients', label: '🧑‍🤝‍🧑 Patients', path: '/patients' },
   { key: 'queue', label: '⏱️ Live Queue', path: '/queue' },
+  { key: 'reports', label: '📊 Reports', path: '/reports' },
 ];
 
 function pageShell({ title, activeKey, secret, clinicName, bodyHtml, extraHead = '' }) {

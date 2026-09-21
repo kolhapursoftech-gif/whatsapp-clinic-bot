@@ -1,6 +1,23 @@
 // server.js
 require('dotenv').config();
 
+// ---------- Last-resort safety net ----------
+// A single async route handler anywhere in this app (or its modules) that
+// forgets a try/catch turns into an unhandled promise rejection — and by
+// default, Node.js CRASHES THE ENTIRE PROCESS on that, taking down every
+// route including the WhatsApp webhook itself, not just the one broken
+// page. These two handlers stop that: they log the error (so it's still
+// visible and fixable in Render's logs) instead of killing the server.
+// This does NOT excuse leaving out try/catch in new route handlers — it's
+// a safety net for the mistake, not a substitute for handling errors
+// properly at the source.
+process.on('unhandledRejection', (err) => {
+  console.error('UNHANDLED REJECTION (server stayed up):', err && err.stack ? err.stack : err);
+});
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT EXCEPTION (server stayed up):', err && err.stack ? err.stack : err);
+});
+
 const express = require('express');
 const axios = require('axios');
 const whatsapp = require('./whatsapp');
@@ -17,6 +34,11 @@ const filesModule = require('./files');
 const dashboardModule = require('./dashboard');
 const casepaperModule = require('./casepaper');
 const schema = require('./schema');
+const staffModule = require('./staff');
+const doctorsModule = require('./doctors');
+const billingModule = require('./billing');
+const reportsModule = require('./reports');
+const reminders = require('./reminders');
 const { sendUnauthorized } = require('./ui');
 
 const app = express();
@@ -171,7 +193,7 @@ async function sendSlotList(phone, state, dateStr) {
 
 async function movePatientToPaymentStep(phone, state, settingsObj) {
   const M = getMessages(state.lang);
-  const visitType = await sheets.getVisitType(phone);
+  const visitType = await sheets.getVisitType(phone, state.name);
   const fee = visitType === 'Follow-up' ? settingsObj.followUpFee : settingsObj.newPatientFee;
   const feeNum = parseInt(fee, 10) || 0;
 
@@ -227,7 +249,7 @@ async function movePatientToPaymentStep(phone, state, settingsObj) {
 }
 
 async function finalizeBooking(phone, name, age, reason, dateStr, slot, token, opts = {}) {
-  const visitType = await sheets.getVisitType(phone);
+  const visitType = await sheets.getVisitType(phone, name);
   const settings = await sheets.getSettings();
   const feeAmount =
     opts.paymentStatus === 'Free' ? 0 : parseInt(visitType === 'Follow-up' ? settings.followUpFee : settings.newPatientFee, 10) || 0;
@@ -324,7 +346,7 @@ async function handleStaffConfirm(lastDigits, staffNum, clinicName) {
   }
 
   const settings = await sheets.getSettings();
-  const visitType = await sheets.getVisitType(pending.phone);
+  const visitType = await sheets.getVisitType(pending.phone, pending.name);
   const fee = visitType === 'Follow-up' ? settings.followUpFee : settings.newPatientFee;
   const paymentStatus = (parseInt(fee, 10) || 0) === 0 ? 'Free' : 'Paid';
 
@@ -607,7 +629,7 @@ function buildDashboardHtml({ clinicName, dateStr, bookings, secret }) {
 // Example: https://your-app.onrender.com/dashboard?secret=YOUR_SECRET
 // Optional &date=YYYY-MM-DD (defaults to today).
 app.get('/dashboard', async (req, res) => {
-  if (req.query.secret !== TRIGGER_SECRET) {
+  if (!staffModule.isAuthorized(req, TRIGGER_SECRET)) {
     return sendUnauthorized(res);
   }
   try {
@@ -639,6 +661,10 @@ profileModule.registerRoutes(app, moduleCtx);
 dashboardModule.registerRoutes(app, moduleCtx);
 queueModule.registerRoutes(app, moduleCtx);
 filesModule.registerRoutes(app, moduleCtx);
+staffModule.registerRoutes(app, moduleCtx);
+doctorsModule.registerRoutes(app, moduleCtx);
+billingModule.registerRoutes(app, moduleCtx);
+reportsModule.registerRoutes(app, moduleCtx);
 
 // ---------- 3. Incoming WhatsApp messages ----------
 
@@ -941,6 +967,21 @@ app.listen(PORT, () => {
   // (which reads Settings/Capacity) runs against them.
   setTimeout(() => runSlotGeneration('startup'), 5000);
   setInterval(() => runSlotGeneration('daily-timer'), 24 * 60 * 60 * 1000);
+
+  // ---------- Appointment reminders ----------
+  // Checks every 20 minutes for bookings whose appointment falls within
+  // "Reminder Hours Before" (Settings tab) and sends a one-time WhatsApp
+  // nudge. See reminders.js for the exact due/idempotency logic.
+  function runReminders(trigger) {
+    reminders
+      .sendDueReminders()
+      .then((r) => {
+        if (r.sent > 0) console.log(`[${trigger}] reminders: sent ${r.sent} (checked ${r.checked} bookings)`);
+      })
+      .catch((err) => console.error(`[${trigger}] reminders failed:`, err.message));
+  }
+  setTimeout(() => runReminders('startup'), 8000);
+  setInterval(() => runReminders('20min-timer'), 20 * 60 * 1000);
 
   // ---------- Self-ping keep-alive (Render free-tier workaround) ----------
   // Render's free web services sleep after ~15 minutes with no INCOMING

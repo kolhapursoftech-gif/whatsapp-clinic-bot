@@ -11,6 +11,7 @@ const { google } = require('googleapis');
 const multer = require('multer');
 const stream = require('stream');
 const sheets = require('./sheets');
+const staff = require('./staff');
 const counters = require('./counters');
 const { sendUnauthorized } = require('./ui');
 
@@ -97,7 +98,7 @@ function registerRoutes(app, ctx) {
   const { TRIGGER_SECRET } = ctx;
 
   app.post('/patients/:patientId/files', upload.single('file'), async (req, res) => {
-    if (req.query.secret !== TRIGGER_SECRET) return sendUnauthorized(res);
+    if (!staff.isAuthorized(req, TRIGGER_SECRET)) return sendUnauthorized(res);
     if (!req.file) return res.status(400).send('No file uploaded (field name must be "file").');
     try {
       await saveFileForPatient({
@@ -115,7 +116,7 @@ function registerRoutes(app, ctx) {
   });
 
   app.post('/files/:fileId/delete', async (req, res) => {
-    if (req.query.secret !== TRIGGER_SECRET) return sendUnauthorized(res);
+    if (!staff.isAuthorized(req, TRIGGER_SECRET)) return sendUnauthorized(res);
     try {
       const meta = await sheets.getFileById(req.params.fileId);
       await removeFile(req.params.fileId);

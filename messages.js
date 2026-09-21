@@ -62,6 +62,8 @@ const TEMPLATES = {
     profileLinkMessage: (link) =>
       `📝 Tumchi kahi additional mahiti (address, allergies, emergency contact) purna karnyasathi khali dilela secure link ughda:\n${link}`,
     queueAlert: '🔔 Tumcha number lavkarach yenar aahe. Kripaya clinic kade yenyachi taiyari theva.',
+    appointmentReminder: (name, dateStr, slotLabel, token) =>
+      `⏰ *Appointment Reminder*\n\n👤 ${name}, tumchi appointment aaj *${slotLabel}* la aahe.\n🎟️ Token: *${token}*\n📅 Date: ${dateStr}\n\nKripaya velewar ya.`,
   },
 
   hi: {
@@ -99,6 +101,8 @@ const TEMPLATES = {
     profileLinkMessage: (link) =>
       `📝 Apni kuch additional jaankari (address, allergies, emergency contact) poori karne ke liye neeche diya gaya secure link kholein:\n${link}`,
     queueAlert: '🔔 Aapka number jald aane wala hai. Kripya clinic aane ki taiyari rakhein.',
+    appointmentReminder: (name, dateStr, slotLabel, token) =>
+      `⏰ *Appointment Reminder*\n\n👤 ${name}, aapki appointment aaj *${slotLabel}* par hai.\n🎟️ Token: *${token}*\n📅 Date: ${dateStr}\n\nKripya samay par aayein.`,
   },
 
   en: {
@@ -136,6 +140,8 @@ const TEMPLATES = {
     profileLinkMessage: (link) =>
       `📝 Please open the secure link below to complete a few additional details (address, allergies, emergency contact):\n${link}`,
     queueAlert: '🔔 Your turn is coming up soon. Please make your way to the clinic.',
+    appointmentReminder: (name, dateStr, slotLabel, token) =>
+      `⏰ *Appointment Reminder*\n\n👤 ${name}, your appointment today is at *${slotLabel}*.\n🎟️ Token: *${token}*\n📅 Date: ${dateStr}\n\nPlease arrive on time.`,
   },
 };
 

@@ -10,6 +10,7 @@
 // untouched — this file only ADDS pages, it doesn't replace anything.
 
 const sheets = require('./sheets');
+const staff = require('./staff');
 const patientsDomain = require('./patients');
 const { pageShell, escapeHtml, sendUnauthorized } = require('./ui');
 
@@ -137,6 +138,13 @@ async function buildDashboardHomeHtml({ clinicName, secret }) {
             }</td></tr>`
         )}</tbody>
       </table>
+    </div>
+
+    <div class="flex" style="margin-top:4px;">
+      <a class="btn outline small" href="/reports?secret=${encodeURIComponent(secret)}">📊 Reports</a>
+      <a class="btn outline small" href="/expenses?secret=${encodeURIComponent(secret)}">💰 Expenses</a>
+      <a class="btn outline small" href="/doctors?secret=${encodeURIComponent(secret)}">🩺 Doctors</a>
+      <a class="btn outline small" href="/staff?secret=${encodeURIComponent(secret)}">👥 Staff</a>
     </div>
   `;
 
@@ -288,7 +296,7 @@ function registerRoutes(app, ctx) {
   const { TRIGGER_SECRET, CLINIC_NAME_FALLBACK } = ctx;
 
   app.get('/dashboard/home', async (req, res) => {
-    if (req.query.secret !== TRIGGER_SECRET) return sendUnauthorized(res);
+    if (!staff.isAuthorized(req, TRIGGER_SECRET)) return sendUnauthorized(res);
     try {
       const settings = await sheets.getSettings();
       const html = await buildDashboardHomeHtml({
@@ -304,7 +312,7 @@ function registerRoutes(app, ctx) {
   });
 
   app.get('/patients', async (req, res) => {
-    if (req.query.secret !== TRIGGER_SECRET) return sendUnauthorized(res);
+    if (!staff.isAuthorized(req, TRIGGER_SECRET)) return sendUnauthorized(res);
     try {
       const settings = await sheets.getSettings();
       const html = await buildPatientsListHtml({
@@ -321,7 +329,7 @@ function registerRoutes(app, ctx) {
   });
 
   app.get('/patients/:patientId', async (req, res) => {
-    if (req.query.secret !== TRIGGER_SECRET) return sendUnauthorized(res);
+    if (!staff.isAuthorized(req, TRIGGER_SECRET)) return sendUnauthorized(res);
     try {
       const settings = await sheets.getSettings();
       const html = await buildPatientDetailHtml({

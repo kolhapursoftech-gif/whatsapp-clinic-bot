@@ -221,7 +221,52 @@ PROFILE_LINK_VALID_DAYS     — optional, defaults to 30. How long a patient's
 
 ---
 
-## 7. Summary of What Changed in Existing Features
+## 8. Full Clinic Management Additions (Billing, Multi-Doctor, Reports, Reminders)
+
+New modules, all wired through the same `?secret=` auth PLUS the new staff
+PIN login (see below) — no existing page's URL or behavior changed:
+
+- **`staff.js` — multi-staff login.** `/staff/login` — each staff member
+  logs in with a short PIN (set in the `Staff` tab, or a super-admin PIN in
+  Settings) and gets a 14-day session cookie. This is ADDITIVE — every
+  existing `?secret=...` link keeps working exactly as before; PIN login is
+  a second way in, not a replacement. Roles: Receptionist < Doctor < Admin.
+  `Reports` and `Expenses` require Doctor or Admin; everything else needs
+  any logged-in staff member (or the master secret). Manage staff at
+  `/staff` (Admin only).
+- **`doctors.js` — multi-doctor.** `/doctors` lists/adds doctors. The
+  WhatsApp booking flow itself is untouched (deliberately — see the header
+  comment in doctors.js for why); instead, staff pick which doctor saw the
+  patient from a dropdown on the case paper, which now gets tagged onto
+  the Booking/Record so Reports can (eventually) be filtered by doctor.
+- **`billing.js` — expenses + invoices.** `/expenses` (add/list/filter by
+  date, Doctor/Admin only) and `/invoice?bookingId=...` (a printable
+  receipt for any booking, in the same visual style as the case paper).
+- **`reports.js` — analytics.** `/reports` (Doctor/Admin only): revenue
+  over time and new-vs-follow-up charts (Chart.js via CDN), top reasons
+  for visit, and Net = Revenue − Expenses, all filterable by date range.
+- **`reminders.js` — WhatsApp appointment reminders.** A 20-minute timer
+  (started in `server.js`, same pattern as slot generation) sends a
+  one-time reminder to patients whose appointment falls within
+  `Reminder Hours Before` (Settings tab, default 2). Idempotent via a new
+  `Reminder Sent` column on Bookings.
+- **New Settings**: `Reminder Hours Before`, `Enable Multi-Doctor`,
+  `Admin PIN`. **New Bookings columns**: `Doctor ID`, `Reminder Sent`.
+  **New Records column**: `Doctor ID`. All auto-created by `schema.js` —
+  see Section 0.
+- **Reliability hardening**: every new route is wrapped in try/catch, PLUS
+  `server.js` now has a top-level `unhandledRejection`/`uncaughtException`
+  safety net — a bug in any one page can no longer crash the whole server
+  (including the WhatsApp webhook) the way an earlier version of
+  `/staff/login` briefly did during testing.
+
+**Known scope limit, stated plainly:** the WhatsApp conversation itself
+does not yet ask "which doctor?" — multi-doctor is currently
+staff-assigned at consult time, not patient-selected at booking time.
+Wiring doctor-selection into the live booking state machine is a
+deliberate follow-up, not something to bolt on as a side effect.
+
+## 7. Summary of What Changed in Existing Features (multi-doctor round)
 
 - **Multiple patients per phone number** — a family sharing one WhatsApp
   number and booking for different members now gets a **separate Patient

@@ -34,6 +34,8 @@ const TAB_SCHEMAS = [
       'Payment Status', 'Visit Type',
       // Added for the dashboard/queue/case-paper/patient-history upgrade:
       'Booking ID', 'Patient ID', 'Case Paper Number', 'Fee', 'Booking Status', 'Queue Status', 'Updated At',
+      // Added for multi-doctor + reminders:
+      'Doctor ID', 'Reminder Sent',
     ],
   },
 
@@ -59,6 +61,7 @@ const TAB_SCHEMAS = [
     headers: [
       'Record ID', 'Patient ID', 'Booking ID', 'Case Paper Number', 'Date', 'Doctor Name', 'Reason',
       'Diagnosis', 'Doctor Notes', 'Prescription ID', 'Prescription Items', 'Created At',
+      'Doctor ID',
     ],
   },
 
@@ -76,6 +79,24 @@ const TAB_SCHEMAS = [
       'Date', 'Token Number', 'Booking ID', 'Patient ID', 'Status',
       'Checked In At', 'Called At', 'Started At', 'Completed At',
     ],
+  },
+
+  // ---- Billing ----
+  {
+    name: 'Expenses',
+    headers: ['Expense ID', 'Date', 'Category', 'Description', 'Amount', 'Paid By', 'Created At'],
+  },
+
+  // ---- Multi-doctor ----
+  {
+    name: 'Doctors',
+    headers: ['Doctor ID', 'Name', 'Specialization', 'WhatsApp Number', 'Active', 'Created At'],
+  },
+
+  // ---- Staff login / roles ----
+  {
+    name: 'Staff',
+    headers: ['Staff ID', 'Name', 'Role', 'PIN', 'Active', 'Created At'],
   },
 ];
 
@@ -106,6 +127,12 @@ const SETTINGS_DEFAULTS = [
   ['Max Capacity Per Slot', '1'],
   ['Days To Generate Ahead', '7'],
   ['Staff WhatsApp Number', ''],
+  // Reminders
+  ['Reminder Hours Before', '2'],
+  // Multi-doctor (single-doctor clinics can leave this blank — see doctors.js)
+  ['Enable Multi-Doctor', 'No'],
+  // Staff login (super-admin PIN — separate from individual staff PINs in the Staff tab)
+  ['Admin PIN', ''],
 ];
 
 // Creates any missing tab, adds any missing column to every tab, and tops

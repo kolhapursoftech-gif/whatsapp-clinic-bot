@@ -516,13 +516,22 @@ async function upsertPatientProfile(phone, { name, age, lang, lastVisitDate }) {
 // number, or null if they've never booked before. Used to decide whether
 // someone is a "New" patient (needs a fresh case paper) or "Follow-up"
 // (case paper from a recent visit is still valid).
-async function getLastVisitDate(phone) {
+async function getLastVisitDate(phone, name) {
   const { header, rows } = await readTab('Bookings');
   const phoneIdx = header.indexOf('Phone Number');
   const dateIdx = header.indexOf('Date');
+  const nameIdx = header.indexOf('Name');
   if (phoneIdx === -1 || dateIdx === -1) return null;
+  const normName = (name || '').trim().toLowerCase();
 
-  const matches = rows.filter((r) => stripQuote(r[phoneIdx]) === phone);
+  // Scoped to THIS person (phone + name), not the whole phone number — a
+  // family member's first-ever visit must count as "New" even if someone
+  // else on the same WhatsApp number visited recently.
+  const matches = rows.filter(
+    (r) =>
+      stripQuote(r[phoneIdx]) === phone &&
+      (nameIdx === -1 || !name || (r[nameIdx] || '').trim().toLowerCase() === normName)
+  );
   if (matches.length === 0) return null;
 
   const dates = matches.map((r) => stripQuote(r[dateIdx])).filter(Boolean).sort();
@@ -530,8 +539,8 @@ async function getLastVisitDate(phone) {
 }
 
 // "New" or "Follow-up", based on Case Paper Validity Days from Settings.
-async function getVisitType(phone) {
-  const lastVisit = await getLastVisitDate(phone);
+async function getVisitType(phone, name) {
+  const lastVisit = await getLastVisitDate(phone, name);
   if (!lastVisit) return 'New';
 
   const settings = await getSettings();
@@ -867,6 +876,17 @@ async function getBookingsForDate(dateStr) {
   return matched.map((r) => rowToObject(header, r));
 }
 
+async function getBookingsBetween(fromDate, toDate) {
+  const { header, rows } = await readTab('Bookings');
+  const dateIdx = header.indexOf('Date');
+  if (dateIdx === -1) return [];
+  const matched = rows.filter((r) => {
+    const d = stripQuote(r[dateIdx]).trim();
+    return d >= fromDate && d <= toDate;
+  });
+  return matched.map((r) => rowToObject(header, r));
+}
+
 // Medicine database with default dosage pattern per medicine, from the
 // "Medicines" tab. Read by COLUMN POSITION (A, B, C, D, E) rather than
 // matching header text exactly — the header row's wording doesn't matter,
@@ -1176,6 +1196,7 @@ module.exports = {
   getVisitType,
   getLastVisitDate,
   getBookingsForDate,
+  getBookingsBetween,
   getMedicineDatabase,
   findBooking,
   getAvailableSlots,

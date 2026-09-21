@@ -97,6 +97,22 @@ async function nextFileId() {
   return `FIL-${year}-${pad(seq, 6)}`;
 }
 
+async function nextExpenseId() {
+  const year = currentIstYear();
+  const seq = await nextSequence(`EXPENSE_${year}`);
+  return `EXP-${year}-${pad(seq, 5)}`;
+}
+
+async function nextDoctorId() {
+  const seq = await nextSequence('DOCTOR');
+  return `DOC-${pad(seq, 3)}`;
+}
+
+async function nextStaffId() {
+  const seq = await nextSequence('STAFF');
+  return `STF-${pad(seq, 3)}`;
+}
+
 // dateStr must be the booking's own YYYY-MM-DD (IST) date — the SAME date
 // the token is displayed against — not "today", so tokens generated ahead
 // of time (or late at night) still key off the correct day's sequence.
@@ -112,5 +128,8 @@ module.exports = {
   nextRecordId,
   nextPrescriptionId,
   nextFileId,
+  nextExpenseId,
+  nextDoctorId,
+  nextStaffId,
   nextDailyToken,
 };
