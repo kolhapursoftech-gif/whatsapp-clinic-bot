@@ -1,7 +1,7 @@
 {
   "name": "whatsapp-clinic-bot",
   "version": "1.0.0",
-  "description": "Free WhatsApp AI receptionist for a doctor's clinic",
+  "description": "Simple WhatsApp booking + payment bot for a clinic (Google Sheet for staff)",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
@@ -13,7 +13,6 @@
     "dotenv": "^16.4.5",
     "google-auth-library": "^9.14.1",
     "googleapis": "^140.0.1",
-    "multer": "^1.4.5-lts.1",
     "qrcode": "^1.5.3",
     "form-data": "^4.0.0"
   }

@@ -1,29 +1,18 @@
 // schema.js
-// SINGLE SOURCE OF TRUTH for the Google Sheet's structure.
+// Sets up the Google Sheet for you. On every server start it:
+//   - creates any tab that is missing
+//   - adds any column that is missing (always to the RIGHT of what is there)
+//   - adds default rows to "Settings" for keys that are missing
+//   - creates the "Today" tab (a formula tab that lists only today's bookings)
 //
-// Whenever a future feature needs a new tab or a new column, add it HERE —
-// nowhere else — and it will be created automatically on the sheet the
-// next time the server starts (or immediately via GET
-// /admin/ensure-schema?secret=...). No more opening the Google Sheet and
-// typing column headers by hand.
+// It NEVER deletes or renames a tab/column and NEVER changes existing data,
+// so it is safe to run any number of times.
 //
-// Rules this file follows so it's always safe to run, any time, as often
-// as you like:
-//   - A tab that already exists is never deleted or renamed.
-//   - A column that already exists is never touched, moved, or removed —
-//     new columns are only ever added to the right of what's there.
-//   - Existing DATA is never modified. This only ever adds structure.
-//
-// If you rename a header here, the OLD header is treated as still
-// missing and a new column is added for the new name — it does not
-// rename the existing one (renaming could silently disconnect the app
-// from data staff have already been using under the old name). Rename
-// deliberately in the Sheet by hand if you really mean it.
+// To apply a change immediately (without a restart) open:
+//   https://your-app.onrender.com/admin/ensure-schema?secret=YOUR_SECRET
 
 const sheets = require('./sheets');
 
-// Tabs where row 1 is a real header row that the rest of the app looks
-// columns up by name in (this is most of the sheet).
 const TAB_SCHEMAS = [
   { name: 'Capacity', headers: ['Date', 'Slot', 'Max Capacity', 'Booked Count'] },
 
@@ -31,93 +20,22 @@ const TAB_SCHEMAS = [
     name: 'Bookings',
     headers: [
       'Timestamp', 'Phone Number', 'Name', 'Age', 'Reason', 'Date', 'Slot', 'Token Number',
-      'Payment Status', 'Visit Type',
-      // Added for the dashboard/queue/case-paper/patient-history upgrade:
-      'Booking ID', 'Patient ID', 'Case Paper Number', 'Fee', 'Booking Status', 'Queue Status', 'Updated At',
-      // Added for multi-doctor + reminders:
-      'Doctor ID', 'Reminder Sent',
+      'Payment Status', 'Fee', 'Booking Status',
     ],
   },
 
   { name: 'Pending', headers: ['Phone Number', 'Step', 'Name', 'Age', 'Reason', 'Date', 'Slot', 'Lang', 'Timestamp'] },
 
-  {
-    name: 'Patients',
-    headers: [
-      'Phone Number', 'Name', 'Age', 'Lang', 'Last Visit Date',
-      // Added for the extended patient profile:
-      'Patient ID', 'Date of Birth', 'Gender', 'Address', 'City', 'Blood Group', 'Allergies',
-      'Medical History', 'Current Medicines', 'Emergency Contact Name', 'Emergency Contact Relation',
-      'Emergency Contact Phone', 'Profile Token', 'Profile Token Expiry', 'Profile Completed',
-      'Total Visits', 'Notes', 'Created At', 'Updated At',
-    ],
-  },
-
-  { name: 'Medicines', headers: ['Medicine Name', 'Morning', 'Evening', 'Before Meal', 'After Meal'] },
-  { name: 'Counters', headers: ['Counter Type', 'Current Value', 'Updated At'] },
-
-  {
-    name: 'Records',
-    headers: [
-      'Record ID', 'Patient ID', 'Booking ID', 'Case Paper Number', 'Date', 'Doctor Name', 'Reason',
-      'Diagnosis', 'Doctor Notes', 'Prescription ID', 'Prescription Items', 'Created At',
-      'Doctor ID',
-    ],
-  },
-
-  {
-    name: 'Files',
-    headers: [
-      'File ID', 'Patient ID', 'Record ID', 'File Name', 'File Type',
-      'Google Drive File ID', 'Google Drive URL', 'Uploaded By', 'Uploaded At',
-    ],
-  },
-
-  {
-    name: 'Queue',
-    headers: [
-      'Date', 'Token Number', 'Booking ID', 'Patient ID', 'Status',
-      'Checked In At', 'Called At', 'Started At', 'Completed At',
-    ],
-  },
-
-  // ---- Billing ----
-  {
-    name: 'Expenses',
-    headers: ['Expense ID', 'Date', 'Category', 'Description', 'Amount', 'Paid By', 'Created At'],
-  },
-
-  // ---- Multi-doctor ----
-  {
-    name: 'Doctors',
-    headers: ['Doctor ID', 'Name', 'Specialization', 'WhatsApp Number', 'Active', 'Created At'],
-  },
-
-  // ---- Staff login / roles ----
-  {
-    name: 'Staff',
-    headers: ['Staff ID', 'Name', 'Role', 'PIN', 'Active', 'Created At'],
-  },
+  { name: 'Patients', headers: ['Phone Number', 'Name', 'Age', 'Lang', 'Last Visit Date'] },
 ];
 
-// Settings is Key/Value pairs, not a header-lookup tab — getSettings()
-// reads row 1 as a header (skipped) and every row after as one setting.
-// So this only needs a header row on first creation, plus: any default
-// key below that doesn't already exist anywhere in the tab gets added as
-// a new row (so a fresh clinic gets sane defaults, and an upgraded clinic
-// gets any brand-new setting a later feature introduces).
 const SETTINGS_HEADER = ['Setting Name', 'Value'];
 const SETTINGS_DEFAULTS = [
   ['Clinic Name', 'My Clinic'],
-  ['Clinic Address', ''],
-  ['Clinic Phone', ''],
-  ['Doctor Name', ''],
-  ['New Patient Fee', '0'],
-  ['Follow-up Fee', '0'],
+  ['Appointment Fee', '0'], // skipped if an older "New Patient Fee" row already exists (see below)
   ['UPI ID', ''],
-  ['Case Paper Validity Days', '30'],
-  ['Minimum Notice Minutes', '30'],
-  ['Queue Alert Minutes', '2'],
+  ['Staff WhatsApp Number', ''],
+  ['Alert WhatsApp Number', ''],
   ['Default Language', 'mr'],
   ['Morning Start', '10:00 AM'],
   ['Morning End', '1:00 PM'],
@@ -126,19 +44,39 @@ const SETTINGS_DEFAULTS = [
   ['Slot Duration Minutes', '15'],
   ['Max Capacity Per Slot', '1'],
   ['Days To Generate Ahead', '7'],
-  ['Staff WhatsApp Number', ''],
-  // Reminders
-  ['Reminder Hours Before', '2'],
-  // Multi-doctor (single-doctor clinics can leave this blank — see doctors.js)
-  ['Enable Multi-Doctor', 'No'],
-  // Staff login (super-admin PIN — separate from individual staff PINs in the Staff tab)
-  ['Admin PIN', ''],
+  ['Minimum Notice Minutes', '30'],
 ];
 
-// Creates any missing tab, adds any missing column to every tab, and tops
-// up any missing Settings default. Safe to call on every server startup
-// and any number of times by hand — it only ever adds, never removes or
-// overwrites. Returns a summary object for logging.
+// "Today" tab: row 1 copies the Bookings headers, A2 is a FILTER formula that
+// shows only the bookings whose Date is today. Created once; never overwritten.
+// (Uses the Sheet's own timezone for TODAY() - set it to India in
+// File > Settings > Time zone.)
+async function ensureTodayTab(existingTabs, report) {
+  if (existingTabs.includes('Today')) return;
+
+  // Find the Date and Booking Status columns BY HEADER NAME, so this works
+  // on an old Sheet where Bookings has extra columns in a different order.
+  const { header } = await sheets.readTab('Bookings');
+  const dateIdx = header.indexOf('Date');
+  const statusIdx = header.indexOf('Booking Status');
+  if (dateIdx === -1) throw new Error('Bookings tab has no "Date" column yet');
+  const dateCol = sheets.colLetter(dateIdx + 1);
+  const lastCol = sheets.colLetter(Math.max(header.length, 1));
+
+  await sheets.createTab('Today');
+  report.tabsCreated.push('Today');
+  await sheets.updateRow('Today', 1, [`={Bookings!A1:${lastCol}1}`]);
+
+  const conditions = [`Bookings!${dateCol}2:${dateCol}=TEXT(TODAY(),"yyyy-mm-dd")`];
+  if (statusIdx !== -1) {
+    const statusCol = sheets.colLetter(statusIdx + 1);
+    conditions.push(`Bookings!${statusCol}2:${statusCol}<>"Cancelled"`);
+  }
+  await sheets.updateRow('Today', 2, [
+    `=IFERROR(FILTER(Bookings!A2:${lastCol}, ${conditions.join(', ')}),"Aaj koi booking nahi")`,
+  ]);
+}
+
 async function ensureSheetSchema() {
   const existingTabs = await sheets.listTabNames();
   const report = { tabsCreated: [], columnsAdded: {}, settingsAdded: [] };
@@ -152,8 +90,6 @@ async function ensureSheetSchema() {
     if (added.length) report.columnsAdded[name] = added;
   }
 
-  // Settings: create the tab (with just its header row) if entirely
-  // missing, then top up any default key that isn't present yet.
   if (!existingTabs.includes('Settings')) {
     await sheets.createTab('Settings');
     report.tabsCreated.push('Settings');
@@ -165,10 +101,20 @@ async function ensureSheetSchema() {
   const { rows: settingsRows } = await sheets.readTab('Settings');
   const existingKeys = new Set(settingsRows.map((r) => (r[0] || '').trim()).filter(Boolean));
   for (const [key, defaultValue] of SETTINGS_DEFAULTS) {
+    // An older Sheet has "New Patient Fee" - don't add "Appointment Fee = 0"
+    // next to it, or the fee would silently become free.
+    if (key === 'Appointment Fee' && existingKeys.has('New Patient Fee')) continue;
     if (!existingKeys.has(key)) {
       await sheets.setSettingValue(key, defaultValue);
       report.settingsAdded.push(key);
     }
+  }
+
+  // Non-fatal: a problem here must never stop the bot from booking patients.
+  try {
+    await ensureTodayTab(existingTabs, report);
+  } catch (err) {
+    console.error('[schema] Could not create "Today" tab (non-fatal):', err.message);
   }
 
   return report;

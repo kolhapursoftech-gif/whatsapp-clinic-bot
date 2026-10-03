@@ -1,77 +1,71 @@
 // server.js
+// Simple WhatsApp clinic booking bot:
+//   missed call -> WhatsApp chat -> name, age, reason, date, time slot
+//   -> UPI payment QR -> patient sends screenshot -> staff taps Confirm
+//   -> booking is saved in the Google Sheet + patient gets a token.
+//
+// Staff see everything in the Google Sheet (link is sent on WhatsApp with
+// every booking, and staff can send "SHEET" to the bot to get it any time).
 require('dotenv').config();
 
 // ---------- Last-resort safety net ----------
-// A single async route handler anywhere in this app (or its modules) that
-// forgets a try/catch turns into an unhandled promise rejection — and by
-// default, Node.js CRASHES THE ENTIRE PROCESS on that, taking down every
-// route including the WhatsApp webhook itself, not just the one broken
-// page. These two handlers stop that: they log the error (so it's still
-// visible and fixable in Render's logs) instead of killing the server.
-// This does NOT excuse leaving out try/catch in new route handlers — it's
-// a safety net for the mistake, not a substitute for handling errors
-// properly at the source.
+// An error inside one handler must never crash the whole server (and with it
+// the WhatsApp webhook). Log it, alert the clinic, keep running.
 process.on('unhandledRejection', (err) => {
   console.error('UNHANDLED REJECTION (server stayed up):', err && err.stack ? err.stack : err);
+  try {
+    require('./alerts').sendAlert('unhandled-rejection', `An unexpected error occurred:\n${err && err.message ? err.message : err}`);
+  } catch (e) {
+    // the alert itself failing must never compound the original problem
+  }
 });
 process.on('uncaughtException', (err) => {
   console.error('UNCAUGHT EXCEPTION (server stayed up):', err && err.stack ? err.stack : err);
+  try {
+    require('./alerts').sendAlert('uncaught-exception', `An unexpected error occurred:\n${err && err.message ? err.message : err}`);
+  } catch (e) {
+    // same as above
+  }
 });
 
 const express = require('express');
 const axios = require('axios');
 const whatsapp = require('./whatsapp');
 const sheets = require('./sheets');
-const { getMessages, LANGUAGE_BUTTONS, languagePrompt, SAME_PATIENT_BUTTONS } = require('./messages');
-
-// New feature modules (added on top of the existing booking flow — see
-// each file's header comment for what it owns).
-const counters = require('./counters');
-const patientsDomain = require('./patients');
-const profileModule = require('./profile');
-const queueModule = require('./queue');
-const filesModule = require('./files');
-const dashboardModule = require('./dashboard');
-const casepaperModule = require('./casepaper');
 const schema = require('./schema');
-const staffModule = require('./staff');
-const doctorsModule = require('./doctors');
-const billingModule = require('./billing');
-const reportsModule = require('./reports');
-const reminders = require('./reminders');
-const { sendUnauthorized } = require('./ui');
+const alerts = require('./alerts');
+const { getMessages, LANGUAGE_BUTTONS, languagePrompt, SAME_PATIENT_BUTTONS } = require('./messages');
 
 const app = express();
 app.use(express.json());
-// Needed for the patient-profile page, which is a plain HTML <form method="POST">
-// (no JS framework) — those submit as application/x-www-form-urlencoded.
-app.use(express.urlencoded({ extended: true }));
 
-// Lightweight, unauthenticated health-check — used by our own self-ping
-// below (Render free-tier keep-alive) and safe to hit from any uptime
-// monitor too. Does not touch Google Sheets/Drive, so it never eats into
-// API quota.
+// Lightweight health-check: used by the self-ping below (Render free-tier
+// keep-alive). Does not touch Google Sheets, so it never uses API quota.
 app.get('/ping', (req, res) => res.status(200).send('OK'));
 
 const CLINIC_NAME_FALLBACK = process.env.CLINIC_NAME || 'the clinic';
-const DOCTOR_NUMBER = process.env.DOCTOR_WHATSAPP_NUMBER; // fallback if Settings tab has none
+const DOCTOR_NUMBER = process.env.DOCTOR_WHATSAPP_NUMBER; // fallback if Settings has no staff number
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
 const TRIGGER_SECRET = (process.env.TRIGGER_SECRET || '').trim();
 
 const CONFIRM_REGEX = /^CONFIRM\s+(\d{3,4})$/i;
+const SHEET_REGEX = /^(sheet|link|sheet link)$/i;
 const LANG_MAP = { lang_mr: 'mr', lang_hi: 'hi', lang_en: 'en' };
 
-// Render sets RENDER_EXTERNAL_URL automatically on most plans. If it's not
-// present for your service, set APP_BASE_URL yourself in the environment
-// variables to your app's actual URL, e.g. https://your-app.onrender.com
+// Render sets RENDER_EXTERNAL_URL automatically; otherwise set APP_BASE_URL
+// to your app's URL, e.g. https://your-app.onrender.com
 const APP_BASE_URL = (process.env.APP_BASE_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
 
-function buildCasePaperLink({ phone, date, token }) {
-  const params = new URLSearchParams({ secret: TRIGGER_SECRET || '', phone, date, token: String(token) });
-  return `${APP_BASE_URL}/case-paper?${params.toString()}`;
+// The Google Sheet staff look at. Built from GOOGLE_SHEET_ID - no extra setup.
+const SHEET_LINK = process.env.GOOGLE_SHEET_ID
+  ? `https://docs.google.com/spreadsheets/d/${process.env.GOOGLE_SHEET_ID}/edit`
+  : '';
+
+function sendUnauthorized(res) {
+  return res.status(401).send('Unauthorized');
 }
 
-// ---------- date helpers (Asia/Kolkata) ----------
+// ---------- date helper (Asia/Kolkata) ----------
 
 function istDateString(offsetDays = 0) {
   const now = new Date();
@@ -98,27 +92,22 @@ app.get('/webhook', (req, res) => {
   return res.sendStatus(403);
 });
 
-// ---------- helpers shared by the missed-call trigger and the webhook handler ----------
+// ---------- booking conversation helpers ----------
 
 // Decides how to greet an incoming patient:
-// 1. If Settings has a "Default Language" forced, skip language selection
-//    entirely and go straight to name (or the same-patient check below).
-// 2. Else if we recognize this phone number (Patients tab), reuse their
-//    saved language and ask "is this for you, or someone else?" instead of
-//    re-collecting name/age.
-// 3. Else (genuinely new number) show the branded English language picker.
+// 1. Settings "Default Language" set -> skip the language picker.
+// 2. Known phone number (Patients tab) -> reuse saved language and ask
+//    "is this for you, or someone else?" instead of re-asking name/age.
+// 3. Brand-new number -> show the language picker.
 async function startConversation(phone) {
   const settings = await sheets.getSettings();
   const clinicName = settings.clinicName || CLINIC_NAME_FALLBACK;
   const forcedLang = settings.defaultLanguage; // '' if not set in Settings
 
   const profile = await sheets.getPatientProfile(phone);
-  console.log(`startConversation: phone=${phone} forcedLang="${forcedLang}" profile=${JSON.stringify(profile)}`);
   const lang = forcedLang || (profile && profile.lang) || '';
 
   if (profile && profile.name) {
-    // Returning patient — skip language picker AND skip re-asking name/age
-    // if it turns out to be the same person.
     const M = getMessages(lang || 'en');
     await sheets.setPendingState(phone, {
       step: 'ASK_SAME_PATIENT',
@@ -135,8 +124,6 @@ async function startConversation(phone) {
   }
 
   if (forcedLang) {
-    // Brand-new number, but the clinic has hardcoded a single language —
-    // skip the picker and go straight into the normal name/age flow.
     const M = getMessages(forcedLang);
     await sheets.setPendingState(phone, {
       step: 'ASK_NAME',
@@ -151,7 +138,6 @@ async function startConversation(phone) {
     return;
   }
 
-  // Brand-new number, no forced language — show the branded picker.
   await sheets.setPendingState(phone, {
     step: 'ASK_LANGUAGE',
     name: '',
@@ -164,9 +150,8 @@ async function startConversation(phone) {
   await whatsapp.sendButtons(phone, languagePrompt(clinicName), LANGUAGE_BUTTONS);
 }
 
-// Sends the slot list for a date if any slots are free, storing that date on
-// the pending state. Returns true if a list was sent, false if the day is
-// fully booked (so the caller can fall back to the next day or apologize).
+// Sends the slot list for a date if any slots are free. Returns true if a
+// list was sent, false if the day is fully booked.
 async function sendSlotList(phone, state, dateStr) {
   const M = getMessages(state.lang);
   const slots = await sheets.getAvailableSlots(dateStr);
@@ -191,78 +176,51 @@ async function sendSlotList(phone, state, dateStr) {
   return true;
 }
 
+// After the patient picks a slot: send the UPI QR (or, if the fee is 0,
+// skip payment and just ask staff to confirm).
 async function movePatientToPaymentStep(phone, state, settingsObj) {
   const M = getMessages(state.lang);
-  const visitType = await sheets.getVisitType(phone, state.name);
-  const fee = visitType === 'Follow-up' ? settingsObj.followUpFee : settingsObj.newPatientFee;
+  const fee = settingsObj.feeAmount;
   const feeNum = parseInt(fee, 10) || 0;
+  const staffNumber = settingsObj.staffNumber || (DOCTOR_NUMBER || '').replace(/\D/g, '');
 
-  // Fee set to 0 in Settings (typically Follow-up Fee) — skip payment
-  // entirely. Staff still has to confirm, but based on the case-paper
-  // validity instead of a payment screenshot.
   if (feeNum === 0) {
-    await sheets.setPendingState(phone, {
-      step: 'AWAITING_STAFF_CONFIRM',
-      name: state.name,
-      age: state.age,
-      reason: state.reason,
-      date: state.date,
-      slot: state.slot,
-      lang: state.lang,
-    });
-    await whatsapp.sendText(phone, M.freeAppointmentMessage(visitType));
+    await sheets.setPendingState(phone, { ...state, step: 'AWAITING_STAFF_CONFIRM' });
+    await whatsapp.sendText(phone, M.freeAppointmentMessage());
 
-    const staffNumber = settingsObj.staffNumber || (DOCTOR_NUMBER || '').replace(/\D/g, '');
     if (staffNumber) {
       const last4 = phone.slice(-4);
-      const lastVisitDate = await sheets.getLastVisitDate(phone);
-      const caseNote = lastVisitDate ? `📋 Last case paper: ${lastVisitDate} (still valid)\n` : '';
       await whatsapp.sendButtons(
         staffNumber,
-        `🆓 *Free ${visitType} Booking*\n\n👤 ${state.name} (${state.age})\n🩺 ${state.reason || '-'}\n📅 ${state.date}  🕒 ${state.slot}\n${caseNote}📱 ...${last4}`,
+        `🆓 *Free Booking*\n\n👤 ${state.name} (${state.age})\n🩺 ${state.reason || '-'}\n📅 ${state.date}  🕒 ${state.slot}\n📱 ...${last4}`,
         [
           { id: `confirm_${last4}`, title: '✅ Confirm' },
           { id: `hold_${last4}`, title: '⏳ Hold' },
         ]
       );
     } else {
-      console.warn('No staff number configured — cannot notify staff about free booking.');
+      console.warn('No staff number configured - cannot notify staff about free booking.');
     }
     return;
   }
 
-  await sheets.setPendingState(phone, {
-    step: 'AWAITING_PAYMENT_SCREENSHOT',
-    name: state.name,
-    age: state.age,
-    reason: state.reason,
-    date: state.date,
-    slot: state.slot,
-    lang: state.lang,
-  });
+  await sheets.setPendingState(phone, { ...state, step: 'AWAITING_PAYMENT_SCREENSHOT' });
   await whatsapp.sendUpiQr(phone, {
     upiId: settingsObj.upiId,
     amount: fee,
     clinicName: settingsObj.clinicName,
-    caption: M.paymentCaption(fee, settingsObj.upiId, settingsObj.clinicName, visitType),
+    caption: M.paymentCaption(fee, settingsObj.upiId, settingsObj.clinicName),
   });
 }
 
+// Saves the confirmed booking into the Sheet, tells the patient, and tells
+// staff (with the Sheet link).
 async function finalizeBooking(phone, name, age, reason, dateStr, slot, token, opts = {}) {
-  const visitType = await sheets.getVisitType(phone, name);
   const settings = await sheets.getSettings();
-  const feeAmount =
-    opts.paymentStatus === 'Free' ? 0 : parseInt(visitType === 'Follow-up' ? settings.followUpFee : settings.newPatientFee, 10) || 0;
+  const feeAmount = opts.paymentStatus === 'Free' ? 0 : parseInt(settings.feeAmount, 10) || 0;
 
-  // --- Patient ID is per (phone, name) — a shared family WhatsApp number
-  // gets one Patient ID per family member, not one shared profile ---
-  const patientId = await patientsDomain.ensurePatientId(phone, name);
-  const bookingId = await counters.nextAppointmentId();
-
-  // Writes ALL columns (old + new) on one row, by header name — see
-  // sheets.appendBookingRow(). If the live Sheet's Bookings tab hasn't had
-  // the new columns added yet, those extra fields are simply skipped (the
-  // original Timestamp..Visit Type columns are unaffected either way).
+  // Written BY HEADER NAME, so the column order in the Sheet does not matter.
+  // Date/Slot/Phone get a leading apostrophe so Sheets keeps them as text.
   await sheets.appendBookingRow({
     Timestamp: new Date().toISOString(),
     'Phone Number': `'${phone}`,
@@ -273,56 +231,22 @@ async function finalizeBooking(phone, name, age, reason, dateStr, slot, token, o
     Slot: `'${slot}`,
     'Token Number': token,
     'Payment Status': opts.paymentStatus || 'Paid',
-    'Visit Type': visitType,
-    'Booking ID': bookingId,
-    'Patient ID': patientId,
-    'Case Paper Number': '', // generated lazily the first time the case paper page is opened
     Fee: feeAmount,
     'Booking Status': 'Confirmed',
-    'Queue Status': 'Waiting',
-    'Updated At': new Date().toISOString(),
   });
 
   await sheets.upsertPatientProfile(phone, { name, age, lang: opts.lang, lastVisitDate: dateStr });
-  await patientsDomain.recordVisit(phone, name, dateStr);
   await sheets.clearPendingState(phone);
 
-  // --- New: create today's live-queue entry for this token ---
-  try {
-    await queueModule.createQueueEntry({ dateStr, tokenNumber: token, bookingId, patientId });
-  } catch (err) {
-    console.error('createQueueEntry error (non-fatal):', err.message);
-  }
-
   const M = getMessages(opts.lang);
-  await whatsapp.sendText(
-    phone,
-    M.bookingConfirmed(opts.clinicName || CLINIC_NAME_FALLBACK, name, token, dateStr, slot)
-  );
-
-  // --- Secure patient-profile completion link — sent ONCE per patient.
-  // If this specific family member has already completed their profile
-  // (checked by phone+name, same identity as everywhere else above), don't
-  // resend the link on every subsequent booking.
-  if (APP_BASE_URL) {
-    try {
-      const existingProfile = await sheets.getPatientProfileByPhoneAndName(phone, name);
-      const alreadyCompleted = existingProfile && existingProfile['Profile Completed'] === 'Yes';
-      if (!alreadyCompleted) {
-        const profileLink = await profileModule.createProfileLink(phone, name, APP_BASE_URL);
-        await whatsapp.sendText(phone, M.profileLinkMessage(profileLink));
-      }
-    } catch (err) {
-      console.error('profile link error (non-fatal):', err.message);
-    }
-  }
+  await whatsapp.sendText(phone, M.bookingConfirmed(opts.clinicName || CLINIC_NAME_FALLBACK, name, token, dateStr, slot));
 
   const notifyNumber = opts.staffNumber || DOCTOR_NUMBER;
   if (notifyNumber) {
-    const casePaperLink = buildCasePaperLink({ phone, date: dateStr, token });
+    const sheetLine = SHEET_LINK ? `\n\n📊 Sheet: ${SHEET_LINK}` : '';
     await whatsapp.sendText(
       notifyNumber,
-      `Naveen Booking: ${name} (${age}) - Token #${token} - ${dateStr} ${slot} - ${visitType} (Payment: ${opts.paymentStatus || 'Paid'})\nKaran: ${reason || '-'}\n\n📋 Case Paper: ${casePaperLink}`
+      `Naveen Booking: ${name} (${age}) - Token #${token} - ${dateStr} ${slot} (Payment: ${opts.paymentStatus || 'Paid'})\nKaran: ${reason || '-'}${sheetLine}`
     );
   }
 }
@@ -346,9 +270,7 @@ async function handleStaffConfirm(lastDigits, staffNum, clinicName) {
   }
 
   const settings = await sheets.getSettings();
-  const visitType = await sheets.getVisitType(pending.phone, pending.name);
-  const fee = visitType === 'Follow-up' ? settings.followUpFee : settings.newPatientFee;
-  const paymentStatus = (parseInt(fee, 10) || 0) === 0 ? 'Free' : 'Paid';
+  const paymentStatus = (parseInt(settings.feeAmount, 10) || 0) === 0 ? 'Free' : 'Paid';
 
   await finalizeBooking(pending.phone, pending.name, pending.age, pending.reason, pending.date, pending.slot, token, {
     paymentStatus,
@@ -360,8 +282,8 @@ async function handleStaffConfirm(lastDigits, staffNum, clinicName) {
 }
 
 // ---------- 2. Missed-call trigger ----------
-// Generic endpoint: point ANY missed-call/forwarding service at this URL.
-// It just needs to POST { "phone": "91XXXXXXXXXX" } with the shared secret.
+// Point ANY missed-call/forwarding service at this URL. It just needs to
+// POST { "phone": "91XXXXXXXXXX" } with the shared secret.
 app.post('/trigger-missed-call', async (req, res) => {
   try {
     if (req.query.secret !== TRIGGER_SECRET && req.headers['x-trigger-secret'] !== TRIGGER_SECRET) {
@@ -378,35 +300,24 @@ app.post('/trigger-missed-call', async (req, res) => {
   }
 });
 
-// ---------- 2b. Admin: auto-generate upcoming Capacity slots ----------
-// Visit this URL in a browser (with your TRIGGER_SECRET) whenever you want
-// to top up the next few days of time slots, based on the Morning/Evening
-// hours, slot duration, and capacity set in the Settings tab. Safe to call
-// repeatedly — it skips date+slot combos that already exist.
-//
+// ---------- 2b. Admin helpers (protected by TRIGGER_SECRET) ----------
+
+// Top up the next few days of time slots (also runs automatically every day).
 // Example: https://your-app.onrender.com/admin/generate-slots?secret=YOUR_SECRET
 app.get('/admin/generate-slots', async (req, res) => {
-  if (req.query.secret !== TRIGGER_SECRET) {
-    return sendUnauthorized(res);
-  }
+  if (req.query.secret !== TRIGGER_SECRET) return sendUnauthorized(res);
   try {
     const summary = await sheets.generateUpcomingSlots();
-    res.send(
-      `Slots generated.\nDays ahead: ${summary.daysAhead}\nSlots per day: ${summary.slotsPerDay}\nNew rows added: ${summary.added}`
-    );
+    res.send(`Slots generated.\nDays ahead: ${summary.daysAhead}\nSlots per day: ${summary.slotsPerDay}\nNew rows added: ${summary.added}`);
   } catch (err) {
     console.error('generate-slots error:', err.message);
     res.status(500).send('Error: ' + err.message);
   }
 });
 
-// Re-runs schema.js's tab/column auto-setup on demand — useful right after
-// deploying new code that added a new column to schema.js, without waiting
-// for the next server restart. Safe to call any time (see schema.js).
+// Re-runs the Sheet auto-setup (tabs/columns/default Settings) on demand.
 app.get('/admin/ensure-schema', async (req, res) => {
-  if (req.query.secret !== TRIGGER_SECRET) {
-    return sendUnauthorized(res);
-  }
+  if (req.query.secret !== TRIGGER_SECRET) return sendUnauthorized(res);
   try {
     const report = await schema.ensureSheetSchema();
     res.json(report);
@@ -416,15 +327,10 @@ app.get('/admin/ensure-schema', async (req, res) => {
   }
 });
 
-// ---------- Debug: what does the server ACTUALLY see in Bookings? ----------
-// Visit /admin/debug-bookings?secret=... — returns plain JSON, no Google
-// login needed, nothing guessed from a screenshot. Shows exactly what
-// getBookingsForDate() sees, so date-matching issues are visible in one
-// look instead of a round trip of screenshots.
+// Shows exactly what the server sees in the Bookings tab (handy when a date
+// does not seem to match).
 app.get('/admin/debug-bookings', async (req, res) => {
-  if (req.query.secret !== TRIGGER_SECRET) {
-    return sendUnauthorized(res);
-  }
+  if (req.query.secret !== TRIGGER_SECRET) return sendUnauthorized(res);
   try {
     const todayComputed = req.query.date || istDateString(0);
     const { header, rows } = await sheets.readTab('Bookings');
@@ -452,274 +358,50 @@ app.get('/admin/debug-bookings', async (req, res) => {
   }
 });
 
-// ---------- 2c. Case paper / prescription page for the doctor ----------
-// MOVED to casepaper.js (upgraded: Case Paper Number, patient history panel,
-// Save Diagnosis & Prescription). Same URL shape as before
-// (/case-paper?secret=&phone=&date=&token=) so the WhatsApp link sent in
-// finalizeBooking() above keeps working unchanged. escapeHtml() below is
-// still used by buildDashboardHtml() further down, so it stays here.
-
-function escapeHtml(str) {
-  return String(str || '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
-
-
-// ---------- 2d. Staff/doctor dashboard — browse any day's patients from a PC ----------
-// Unlike the one-off case-paper link sent via WhatsApp at booking time, this
-// page can be opened anytime (bookmark it) and lets staff pick a date and
-// jump straight into any patient's case paper.
-
-function buildDashboardHtml({ clinicName, dateStr, bookings, secret }) {
-  const total = bookings.length;
-  const newCount = bookings.filter((b) => b['Visit Type'] === 'New').length;
-  const followUpCount = bookings.filter((b) => b['Visit Type'] === 'Follow-up').length;
-  const paidCount = bookings.filter((b) => b['Payment Status'] === 'Paid').length;
-  const freeCount = bookings.filter((b) => b['Payment Status'] === 'Free').length;
-
-  const rowsHtml = bookings.length
-    ? bookings
-        .map((b) => {
-          const phone = String(b['Phone Number'] || '').replace(/^'/, '');
-          const bookingDate = String(b['Date'] || '').replace(/^'/, '');
-          const slot = String(b['Slot'] || '').replace(/^'/, '');
-          const tokenVal = b['Token Number'];
-          const link = `/case-paper?${new URLSearchParams({
-            secret,
-            phone,
-            date: bookingDate,
-            token: String(tokenVal),
-          }).toString()}`;
-          const visitType = b['Visit Type'] || '';
-          const paymentStatus = b['Payment Status'] || '';
-          return `
-          <tr class="patient-row" data-name="${escapeHtml((b.Name || '').toLowerCase())}">
-            <td class="center token-cell">${escapeHtml(tokenVal)}</td>
-            <td class="name-cell">${escapeHtml(b.Name)}</td>
-            <td class="center">${escapeHtml(b.Age)}</td>
-            <td class="center">${escapeHtml(slot)}</td>
-            <td class="reason-cell">${escapeHtml(b.Reason) || '-'}</td>
-            <td class="center"><span class="badge ${visitType === 'New' ? 'new' : 'followup'}">${escapeHtml(visitType)}</span></td>
-            <td class="center"><span class="paystatus ${paymentStatus === 'Free' ? 'free' : 'paid'}">${escapeHtml(paymentStatus)}</span></td>
-            <td class="center"><a class="open-btn" href="${link}" target="_blank">📋 Open</a></td>
-          </tr>`;
-        })
-        .join('')
-    : `<tr><td colspan="8" class="empty">No bookings for this date yet.</td></tr>`;
-
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Dashboard - ${escapeHtml(clinicName)}</title>
-<style>
-  * { box-sizing: border-box; }
-  body {
-    font-family: 'Segoe UI', Arial, Helvetica, sans-serif;
-    margin: 0; padding: 32px 16px; color: #1f2b26; background: #eef2f0;
-  }
-  .wrap { max-width: 1080px; margin: 0 auto; }
-
-  .topbar { display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 22px; flex-wrap: wrap; gap: 12px; }
-  .topbar h1 { color: #14532d; font-size: 23px; margin: 0 0 4px; font-weight: 700; }
-  .topbar .sub { color: #6b7d74; font-size: 13px; margin: 0; }
-
-  .toolbar {
-    display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
-    margin-bottom: 20px; background: #fff; padding: 14px 18px; border-radius: 12px;
-    border: 1px solid #e0e9e4; box-shadow: 0 2px 10px rgba(15,60,45,0.04);
-  }
-  .toolbar form { display: flex; gap: 10px; align-items: center; }
-  .toolbar input[type="date"] { padding: 7px 10px; border: 1px solid #cdd9d3; border-radius: 7px; font-size: 13.5px; }
-  .toolbar button[type="submit"] { padding: 8px 18px; background: #14532d; color: #fff; border: none; border-radius: 7px; cursor: pointer; font-size: 13.5px; font-weight: 600; }
-  .toolbar input[type="search"] { flex: 1; min-width: 160px; padding: 8px 12px; border: 1px solid #cdd9d3; border-radius: 7px; font-size: 13.5px; }
-
-  .stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 20px; }
-  .stat-card { background: #fff; border: 1px solid #e0e9e4; border-radius: 12px; padding: 14px 16px; box-shadow: 0 2px 10px rgba(15,60,45,0.04); }
-  .stat-card .num { font-size: 22px; font-weight: 700; color: #14532d; }
-  .stat-card .lbl { font-size: 11px; color: #7c8f85; text-transform: uppercase; letter-spacing: 0.04em; margin-top: 2px; font-weight: 600; }
-
-  table { width: 100%; border-collapse: separate; border-spacing: 0; background: #fff; border-radius: 12px; overflow: hidden; border: 1px solid #e0e9e4; box-shadow: 0 2px 10px rgba(15,60,45,0.04); }
-  th, td { border-bottom: 1px solid #eef2ef; padding: 11px 10px; font-size: 13.5px; text-align: left; }
-  th { background: #14532d; color: #fff; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
-  tbody tr:last-child td { border-bottom: none; }
-  tbody tr:hover { background: #f7faf8; }
-  td.center, th.center { text-align: center; }
-  .name-cell { font-weight: 600; }
-  .token-cell { font-weight: 700; color: #14532d; }
-  .reason-cell { color: #556059; }
-  .badge { display: inline-block; padding: 2px 11px; border-radius: 20px; font-size: 10.5px; font-weight: 700; }
-  .badge.new { background: #fdecd4; color: #a15c00; }
-  .badge.followup { background: #dcf1e6; color: #14532d; }
-  .paystatus { font-size: 12px; font-weight: 600; }
-  .paystatus.free { color: #b8862f; }
-  .paystatus.paid { color: #14532d; }
-  .open-btn { display: inline-block; padding: 6px 14px; background: #14532d; color: #fff !important; border-radius: 7px; text-decoration: none; font-size: 12.5px; font-weight: 600; }
-  .open-btn:hover { background: #0f3f22; }
-  .empty { text-align: center; color: #9aa8a1; padding: 30px; }
-</style>
-</head>
-<body>
-<div class="wrap">
-
-  <div class="topbar">
-    <div>
-      <h1>${escapeHtml(clinicName)} — Patient Dashboard</h1>
-      <p class="sub">Bookings for ${escapeHtml(dateStr)}. Bookmark this page for quick access anytime.</p>
-    </div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;">
-      <a href="/dashboard/home?secret=${encodeURIComponent(secret)}" style="font-size:12.5px;font-weight:600;color:#14532d;text-decoration:none;padding:7px 14px;border:1.5px solid #14532d;border-radius:7px;">🏠 Dashboard Home</a>
-      <a href="/patients?secret=${encodeURIComponent(secret)}" style="font-size:12.5px;font-weight:600;color:#14532d;text-decoration:none;padding:7px 14px;border:1.5px solid #14532d;border-radius:7px;">🧑‍🤝‍🧑 Patients</a>
-      <a href="/queue?secret=${encodeURIComponent(secret)}" style="font-size:12.5px;font-weight:600;color:#14532d;text-decoration:none;padding:7px 14px;border:1.5px solid #14532d;border-radius:7px;">⏱️ Live Queue</a>
-    </div>
-  </div>
-
-  <div class="stats">
-    <div class="stat-card"><div class="num">${total}</div><div class="lbl">Total</div></div>
-    <div class="stat-card"><div class="num">${newCount}</div><div class="lbl">New</div></div>
-    <div class="stat-card"><div class="num">${followUpCount}</div><div class="lbl">Follow-up</div></div>
-    <div class="stat-card"><div class="num">${paidCount}</div><div class="lbl">Paid</div></div>
-    <div class="stat-card"><div class="num">${freeCount}</div><div class="lbl">Free</div></div>
-  </div>
-
-  <div class="toolbar">
-    <form method="get">
-      <input type="hidden" name="secret" value="${escapeHtml(secret)}">
-      <label>Date: <input type="date" name="date" value="${escapeHtml(dateStr)}"></label>
-      <button type="submit">Load</button>
-    </form>
-    <input type="search" id="searchBox" placeholder="🔍 Search by patient name..." oninput="filterRows(this.value)">
-  </div>
-
-  <table>
-    <thead>
-      <tr>
-        <th class="center">Token</th>
-        <th>Name</th>
-        <th class="center">Age</th>
-        <th class="center">Time</th>
-        <th>Reason</th>
-        <th class="center">Visit Type</th>
-        <th class="center">Payment</th>
-        <th class="center">Case Paper</th>
-      </tr>
-    </thead>
-    <tbody id="patientBody">
-      ${rowsHtml}
-    </tbody>
-  </table>
-</div>
-
-<script>
-  function filterRows(query) {
-    const q = query.trim().toLowerCase();
-    document.querySelectorAll('#patientBody tr.patient-row').forEach((row) => {
-      row.style.display = row.dataset.name.includes(q) ? '' : 'none';
-    });
-  }
-</script>
-</body>
-</html>`;
-}
-
-// Example: https://your-app.onrender.com/dashboard?secret=YOUR_SECRET
-// Optional &date=YYYY-MM-DD (defaults to today).
-app.get('/dashboard', async (req, res) => {
-  if (!staffModule.isAuthorized(req, TRIGGER_SECRET)) {
-    return sendUnauthorized(res);
-  }
-  try {
-    const settings = await sheets.getSettings();
-    const dateStr = req.query.date || istDateString(0);
-    const bookings = await sheets.getBookingsForDate(dateStr);
-
-    const html = buildDashboardHtml({
-      clinicName: settings.clinicName || CLINIC_NAME_FALLBACK,
-      dateStr,
-      bookings,
-      secret: TRIGGER_SECRET,
-    });
-
-    res.set('Content-Type', 'text/html');
-    res.send(html);
-  } catch (err) {
-    console.error('dashboard error:', err.message);
-    res.status(500).send('Error loading dashboard: ' + err.message);
-  }
-});
-
-// ---------- 2e. New feature modules — routes ----------
-// Each module owns its own routes; server.js just mounts them with the same
-// shared secret used everywhere else (?secret=TRIGGER_SECRET).
-const moduleCtx = { TRIGGER_SECRET, CLINIC_NAME_FALLBACK };
-casepaperModule.registerRoutes(app, moduleCtx);
-profileModule.registerRoutes(app, moduleCtx);
-dashboardModule.registerRoutes(app, moduleCtx);
-queueModule.registerRoutes(app, moduleCtx);
-filesModule.registerRoutes(app, moduleCtx);
-staffModule.registerRoutes(app, moduleCtx);
-doctorsModule.registerRoutes(app, moduleCtx);
-billingModule.registerRoutes(app, moduleCtx);
-reportsModule.registerRoutes(app, moduleCtx);
-
 // ---------- 3. Incoming WhatsApp messages ----------
 
 app.post('/webhook', async (req, res) => {
   // Always ack immediately; WhatsApp retries aggressively on non-200s.
   res.sendStatus(200);
 
-  console.log('POST /webhook received:', JSON.stringify(req.body));
-
   const event = whatsapp.parseIncomingMessage(req.body);
-  if (!event || !event.from) {
-    console.log('Not a patient message (status update or unparseable) — ignoring.');
-    return;
-  }
+  if (!event || !event.from) return; // status update or unparseable
 
   const { from, text, buttonId, imageId } = event;
-  console.log(`Parsed event: from=${from} text=${text} buttonId=${buttonId} imageId=${imageId}`);
+  console.log(`Incoming: from=${from} text=${text} buttonId=${buttonId} imageId=${imageId}`);
 
   try {
     const settings = await sheets.getSettings();
     const staffNumber = settings.staffNumber || (DOCTOR_NUMBER || '').replace(/\D/g, '');
     const clinicName = settings.clinicName || CLINIC_NAME_FALLBACK;
 
-    // ---- Staff replying to approve/hold a payment screenshot ----
-    // Accepts either typing "CONFIRM 9876" OR tapping the Confirm/Hold
-    // buttons sent alongside the forwarded screenshot.
+    // ---- Staff: tap Confirm/Hold on a payment, or ask for the Sheet link ----
     if (staffNumber && from === staffNumber) {
       if (text && CONFIRM_REGEX.test(text)) {
-        const lastDigits = text.match(CONFIRM_REGEX)[1];
-        await handleStaffConfirm(lastDigits, staffNumber, clinicName);
+        await handleStaffConfirm(text.match(CONFIRM_REGEX)[1], staffNumber, clinicName);
       } else if (buttonId && buttonId.startsWith('confirm_')) {
-        const lastDigits = buttonId.replace('confirm_', '');
-        await handleStaffConfirm(lastDigits, staffNumber, clinicName);
+        await handleStaffConfirm(buttonId.replace('confirm_', ''), staffNumber, clinicName);
       } else if (buttonId && buttonId.startsWith('hold_')) {
         const lastDigits = buttonId.replace('hold_', '');
         await whatsapp.sendText(
           staffNumber,
           `⏳ Thik aahe. Jevha khatri hoil tevha *Confirm* button dabaa, kiva "CONFIRM ${lastDigits}" pathva.`
         );
+      } else if (text && SHEET_REGEX.test(text)) {
+        await whatsapp.sendText(staffNumber, SHEET_LINK ? `📊 Sheet: ${SHEET_LINK}` : 'Sheet link available nahi (GOOGLE_SHEET_ID set nahi).');
       } else {
-        // Any other message from the staff number (typos, "ok", forwarded
-        // media, etc.) is ignored here instead of falling through to the
-        // patient booking flow below — otherwise the bot would mistakenly
-        // start asking the staff member for their name/age.
+        // Anything else from the staff number is ignored - otherwise the bot
+        // would start asking the staff member for their name/age.
         console.log(`Ignoring non-actionable message from staff number: "${text}" buttonId=${buttonId}`);
       }
       return;
     }
 
-    let state = await sheets.getPendingState(from);
-    console.log('Current pending state:', JSON.stringify(state));
+    const state = await sheets.getPendingState(from);
 
     if (!state || state.step === 'DONE' || !state.step) {
-      // Fresh conversation (patient messaged in without going through the
-      // missed-call trigger, or their previous booking is already complete).
+      // Fresh conversation (patient messaged in without a missed call, or
+      // their previous booking is already complete).
       await startConversation(from);
       return;
     }
@@ -741,7 +423,6 @@ app.post('/webhook', async (req, res) => {
 
     if (state.step === 'ASK_SAME_PATIENT') {
       if (buttonId === 'same_patient') {
-        // Skip straight to the reason — name/age are already known.
         await sheets.setPendingState(from, {
           step: 'ASK_REASON',
           name: state.name,
@@ -755,21 +436,10 @@ app.post('/webhook', async (req, res) => {
         return;
       }
       if (buttonId === 'different_patient') {
-        // Someone else is using this WhatsApp number — collect a fresh
-        // name/age, but keep the already-known language.
-        await sheets.setPendingState(from, {
-          step: 'ASK_NAME',
-          name: '',
-          age: '',
-          reason: '',
-          date: '',
-          slot: '',
-          lang: state.lang,
-        });
+        await sheets.setPendingState(from, { step: 'ASK_NAME', name: '', age: '', reason: '', date: '', slot: '', lang: state.lang });
         await whatsapp.sendText(from, M.welcomeAskName(clinicName));
         return;
       }
-      // Didn't tap a button — re-ask.
       await whatsapp.sendButtons(from, M.askSamePatient(state.name), SAME_PATIENT_BUTTONS);
       return;
     }
@@ -781,15 +451,7 @@ app.post('/webhook', async (req, res) => {
         await whatsapp.sendText(from, M.invalidName);
         return;
       }
-      await sheets.setPendingState(from, {
-        step: 'ASK_AGE',
-        name: cleanedName,
-        age: '',
-        reason: '',
-        date: '',
-        slot: '',
-        lang: state.lang,
-      });
+      await sheets.setPendingState(from, { step: 'ASK_AGE', name: cleanedName, age: '', reason: '', date: '', slot: '', lang: state.lang });
       await whatsapp.sendText(from, M.askAge(cleanedName));
       return;
     }
@@ -800,15 +462,7 @@ app.post('/webhook', async (req, res) => {
         await whatsapp.sendText(from, M.invalidAge);
         return;
       }
-      await sheets.setPendingState(from, {
-        step: 'ASK_REASON',
-        name: state.name,
-        age: String(age),
-        reason: '',
-        date: '',
-        slot: '',
-        lang: state.lang,
-      });
+      await sheets.setPendingState(from, { step: 'ASK_REASON', name: state.name, age: String(age), reason: '', date: '', slot: '', lang: state.lang });
       await whatsapp.sendText(from, M.askReason);
       return;
     }
@@ -837,18 +491,15 @@ app.post('/webhook', async (req, res) => {
       else if (buttonId === 'tomorrow') offsetDays = 1;
 
       if (offsetDays === null) {
-        // Didn't use the buttons / typed something else — re-show them.
         await whatsapp.sendButtons(from, M.askDateRetry, M.dateButtons);
         return;
       }
 
-      const dateStr = istDateString(offsetDays);
-      const sentToday = await sendSlotList(from, state, dateStr);
+      const sentToday = await sendSlotList(from, state, istDateString(offsetDays));
 
       if (!sentToday && offsetDays === 0) {
         // Today full -> try tomorrow automatically.
-        const tomorrowStr = istDateString(1);
-        const sentTomorrow = await sendSlotList(from, state, tomorrowStr);
+        const sentTomorrow = await sendSlotList(from, state, istDateString(1));
         if (!sentTomorrow) {
           await whatsapp.sendText(from, M.allFull);
           await sheets.clearPendingState(from);
@@ -865,7 +516,6 @@ app.post('/webhook', async (req, res) => {
 
     if (state.step === 'ASK_SLOT') {
       if (!buttonId) {
-        // Didn't pick from the list — re-send it for the same date.
         const sent = await sendSlotList(from, state, state.date);
         if (!sent) {
           await whatsapp.sendText(from, M.noSlots);
@@ -873,9 +523,7 @@ app.post('/webhook', async (req, res) => {
         }
         return;
       }
-
-      const updatedState = { ...state, slot: buttonId };
-      await movePatientToPaymentStep(from, updatedState, settings);
+      await movePatientToPaymentStep(from, { ...state, slot: buttonId }, settings);
       return;
     }
 
@@ -893,7 +541,7 @@ app.post('/webhook', async (req, res) => {
             ]
           );
         } else {
-          console.warn('No staff number configured (Settings tab / DOCTOR_WHATSAPP_NUMBER) — cannot forward screenshot.');
+          console.warn('No staff number configured (Settings tab / DOCTOR_WHATSAPP_NUMBER) - cannot forward screenshot.');
         }
         await sheets.setPendingState(from, { ...state, step: 'AWAITING_STAFF_CONFIRM' });
         await whatsapp.sendText(from, M.screenshotReceived);
@@ -912,14 +560,11 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// ---------- Safety net: catch anything any route above didn't handle ----------
-// itself (a thrown error, a rejected promise Express catches automatically
-// in v5, or a bug we missed). Without this, such a crash can render as a
-// blank/default page with no clue what happened.
+// ---------- Safety net for any route error ----------
 app.use((err, req, res, next) => {
   console.error('Unhandled error on', req.method, req.path, ':', err && err.stack ? err.stack : err);
   if (res.headersSent) return next(err);
-  res.status(500).send('Something went wrong on the server. Check the Render logs for details — search for "Unhandled error on ' + req.path + '".');
+  res.status(500).send('Something went wrong on the server. Check the Render logs.');
 });
 
 const PORT = process.env.PORT || 3000;
@@ -927,71 +572,33 @@ app.listen(PORT, () => {
   console.log(`WhatsApp clinic bot listening on port ${PORT}`);
 
   // ---------- Auto-create/extend the Google Sheet structure ----------
-  // Every tab/column the app needs is defined once in schema.js. This
-  // creates whatever is missing (new tabs, new columns on existing tabs,
-  // default Settings) every time the server starts — so shipping a new
-  // feature that needs a new column is just: add it to schema.js, deploy,
-  // done. Nothing here is ever destructive (see schema.js's header comment
-  // for the exact rules) — safe to run on every single startup.
   schema
     .ensureSheetSchema()
     .then((report) => {
       if (report.tabsCreated.length) console.log('[schema] Created new tabs:', report.tabsCreated.join(', '));
       if (Object.keys(report.columnsAdded).length) console.log('[schema] Added columns:', JSON.stringify(report.columnsAdded));
       if (report.settingsAdded.length) console.log('[schema] Added default Settings:', report.settingsAdded.join(', '));
-      if (!report.tabsCreated.length && !Object.keys(report.columnsAdded).length && !report.settingsAdded.length) {
-        console.log('[schema] Sheet already matches schema.js — nothing to add.');
-      }
     })
     .catch((err) => console.error('[schema] ensureSheetSchema failed:', err.message));
 
   // ---------- Automatic daily slot generation ----------
-  // generateUpcomingSlots() was previously only reachable by manually
-  // visiting /admin/generate-slots — if nobody opened that link on a given
-  // day, the Capacity tab stopped growing and slots silently ran out.
-  // Now it also runs once at startup and then every 24 hours for as long
-  // as this process stays alive.
-  //
-  // CAVEAT (Render free tier): a free web service "sleeps" after ~15 min
-  // with no incoming traffic, which pauses this timer too. The self-ping
-  // block right below keeps it awake without needing any external service.
   function runSlotGeneration(trigger) {
     sheets
       .generateUpcomingSlots()
-      .then((summary) =>
-        console.log(`[${trigger}] generateUpcomingSlots: added ${summary.added} new slot rows (daysAhead=${summary.daysAhead}, slotsPerDay=${summary.slotsPerDay})`)
-      )
-      .catch((err) => console.error(`[${trigger}] generateUpcomingSlots failed:`, err.message));
+      .then((summary) => console.log(`[${trigger}] generateUpcomingSlots: added ${summary.added} new slot rows`))
+      .catch((err) => {
+        console.error(`[${trigger}] generateUpcomingSlots failed:`, err.message);
+        alerts.sendAlert('slot-generation-failed', `Slot generation failed: ${err.message}`);
+      });
   }
-  // Give the schema a moment to finish creating tabs before slot generation
-  // (which reads Settings/Capacity) runs against them.
+  // Short delay so the schema step can create the tabs first.
   setTimeout(() => runSlotGeneration('startup'), 5000);
   setInterval(() => runSlotGeneration('daily-timer'), 24 * 60 * 60 * 1000);
 
-  // ---------- Appointment reminders ----------
-  // Checks every 20 minutes for bookings whose appointment falls within
-  // "Reminder Hours Before" (Settings tab) and sends a one-time WhatsApp
-  // nudge. See reminders.js for the exact due/idempotency logic.
-  function runReminders(trigger) {
-    reminders
-      .sendDueReminders()
-      .then((r) => {
-        if (r.sent > 0) console.log(`[${trigger}] reminders: sent ${r.sent} (checked ${r.checked} bookings)`);
-      })
-      .catch((err) => console.error(`[${trigger}] reminders failed:`, err.message));
-  }
-  setTimeout(() => runReminders('startup'), 8000);
-  setInterval(() => runReminders('20min-timer'), 20 * 60 * 1000);
-
   // ---------- Self-ping keep-alive (Render free-tier workaround) ----------
-  // Render's free web services sleep after ~15 minutes with no INCOMING
-  // request, which also pauses every setInterval above. Hitting our own
-  // public /ping URL every 10 minutes is itself an incoming request from
-  // Render's point of view, so it resets that idle timer — no external
-  // cron service, no paid plan, nothing to sign up for.
-  // Honest caveat: this is a widely-used workaround, not an official
-  // Render guarantee. If you move to a paid Render plan (which doesn't
-  // sleep), this block is harmless and simply becomes a no-op.
+  // Free web services sleep after ~15 min without an incoming request, which
+  // also pauses the timer above. Pinging our own /ping every 10 minutes keeps
+  // it awake. (Widely used workaround, not an official Render guarantee.)
   if (APP_BASE_URL) {
     setInterval(() => {
       axios.get(`${APP_BASE_URL}/ping`, { timeout: 10000 }).catch((err) => {
@@ -999,18 +606,13 @@ app.listen(PORT, () => {
       });
     }, 10 * 60 * 1000);
   } else {
-    console.warn('APP_BASE_URL not set — self-ping keep-alive disabled (service may sleep on Render free tier).');
+    console.warn('APP_BASE_URL not set - self-ping keep-alive disabled (service may sleep on Render free tier).');
   }
 
-  // Publish the dashboard link into the Settings tab so the clinic can just
-  // open the Sheet and copy it, instead of building the URL by hand.
-  if (APP_BASE_URL && TRIGGER_SECRET) {
-    const dashboardLink = `${APP_BASE_URL}/dashboard?secret=${TRIGGER_SECRET}`;
+  // Publish the Sheet link into the Settings tab too, so it is easy to copy.
+  if (SHEET_LINK) {
     sheets
-      .setSettingValue('Dashboard Link', dashboardLink)
-      .then(() => console.log('Dashboard Link written to Settings tab:', dashboardLink))
-      .catch((err) => console.error('Could not write Dashboard Link to Settings tab:', err.message));
-  } else {
-    console.warn('APP_BASE_URL or TRIGGER_SECRET not set — skipping Dashboard Link auto-publish.');
+      .setSettingValue('Sheet Link', SHEET_LINK)
+      .catch((err) => console.error('Could not write Sheet Link to Settings tab:', err.message));
   }
 });

@@ -49,21 +49,16 @@ const TEMPLATES = {
     askSlotButtonLabel: 'Vel nivda',
     slotsLeftLabel: 'shillak',
     noSlots: '😔 Kshama kara, ya divashi ekahi vel shillak nahi. Kripaya doosra divas nivda.',
-    paymentCaption: (fee, upiId, clinic, visitType) =>
-      `🧾 *${clinic}*\n${visitType === 'New' ? '🆕 New Patient (naveen case paper)' : '🔁 Follow-up Patient'}\n\n💳 Appointment Fee: *Rs ${fee}*\nUPI ID: *${upiId}*\n\nQR scan karun payment kara, ani payment cha *screenshot* ithech pathva.`,
-    freeAppointmentMessage: (visitType) =>
-      `✅ Tumchi appointment *MOFAT (free)* aahe${visitType === 'Follow-up' ? ' (Follow-up)' : ''}.\nStaff confirm karat aahet, kripaya thoda vel thamba.`,
+    paymentCaption: (fee, upiId, clinic) =>
+      `🧾 *${clinic}*\n\n💳 Appointment Fee: *Rs ${fee}*\nUPI ID: *${upiId}*\n\nQR scan karun payment kara, ani payment cha *screenshot* ithech pathva.`,
+    freeAppointmentMessage: () =>
+      `✅ Tumchi appointment *MOFAT (free)* aahe.\nStaff confirm karat aahet, kripaya thoda vel thamba.`,
     screenshotReceived: '✅ Dhanyawad! Tumcha payment screenshot milala.\nStaff verify karat aahet, kripaya thoda vel thamba.',
     askForScreenshot: '📸 Kripaya payment cha screenshot (photo) pathva.',
     stillWaiting: '⏳ Amhi tumcha payment verify karat aahot. Kripaya thoda vel thamba, confirmation lavkarach yeil.',
     bookingConfirmed: (clinic, name, token, dateStr, slotLabel) =>
       `✅ *${clinic}*\n*Booking Confirm Zali!*\n\n👤 Naav: *${name}*\n🎟️ Token Number: *${token}*\n📅 Date: *${dateStr}*\n🕒 Vel: *${slotLabel}*\n\nKripaya tumcha token number sobat ghevun ya.`,
     slotNowFull: '😔 Kshama kara, tumchi nivadleli vel ata full zali aahe. Kripaya doctor shi sampark sadha.',
-    profileLinkMessage: (link) =>
-      `📝 Tumchi kahi additional mahiti (address, allergies, emergency contact) purna karnyasathi khali dilela secure link ughda:\n${link}`,
-    queueAlert: '🔔 Tumcha number lavkarach yenar aahe. Kripaya clinic kade yenyachi taiyari theva.',
-    appointmentReminder: (name, dateStr, slotLabel, token) =>
-      `⏰ *Appointment Reminder*\n\n👤 ${name}, tumchi appointment aaj *${slotLabel}* la aahe.\n🎟️ Token: *${token}*\n📅 Date: ${dateStr}\n\nKripaya velewar ya.`,
   },
 
   hi: {
@@ -88,21 +83,16 @@ const TEMPLATES = {
     askSlotButtonLabel: 'Samay chunein',
     slotsLeftLabel: 'bache hain',
     noSlots: '😔 Maaf kijiye, is din koi samay khali nahi hai. Kripya doosra din chunein.',
-    paymentCaption: (fee, upiId, clinic, visitType) =>
-      `🧾 *${clinic}*\n${visitType === 'New' ? '🆕 New Patient (naya case paper)' : '🔁 Follow-up Patient'}\n\n💳 Appointment Fee: *Rs ${fee}*\nUPI ID: *${upiId}*\n\nQR scan karke payment karein, aur payment ka *screenshot* yahin bhejein.`,
-    freeAppointmentMessage: (visitType) =>
-      `✅ Aapki appointment *MUFT (free)* hai${visitType === 'Follow-up' ? ' (Follow-up)' : ''}.\nStaff confirm kar rahe hain, kripya thoda intezaar karein.`,
+    paymentCaption: (fee, upiId, clinic) =>
+      `🧾 *${clinic}*\n\n💳 Appointment Fee: *Rs ${fee}*\nUPI ID: *${upiId}*\n\nQR scan karke payment karein, aur payment ka *screenshot* yahin bhejein.`,
+    freeAppointmentMessage: () =>
+      `✅ Aapki appointment *MUFT (free)* hai.\nStaff confirm kar rahe hain, kripya thoda intezaar karein.`,
     screenshotReceived: '✅ Dhanyawad! Aapka payment screenshot mil gaya.\nStaff verify kar rahe hain, kripya thoda intezaar karein.',
     askForScreenshot: '📸 Kripya payment ka screenshot (photo) bhejein.',
     stillWaiting: '⏳ Hum aapka payment verify kar rahe hain. Kripya thoda intezaar karein, confirmation jald aayega.',
     bookingConfirmed: (clinic, name, token, dateStr, slotLabel) =>
       `✅ *${clinic}*\n*Booking Confirm Ho Gayi!*\n\n👤 Naam: *${name}*\n🎟️ Token Number: *${token}*\n📅 Date: *${dateStr}*\n🕒 Samay: *${slotLabel}*\n\nKripya apna token number saath layein.`,
     slotNowFull: '😔 Maaf kijiye, aapka chuna hua samay ab full ho gaya hai. Kripya doctor se sampark karein.',
-    profileLinkMessage: (link) =>
-      `📝 Apni kuch additional jaankari (address, allergies, emergency contact) poori karne ke liye neeche diya gaya secure link kholein:\n${link}`,
-    queueAlert: '🔔 Aapka number jald aane wala hai. Kripya clinic aane ki taiyari rakhein.',
-    appointmentReminder: (name, dateStr, slotLabel, token) =>
-      `⏰ *Appointment Reminder*\n\n👤 ${name}, aapki appointment aaj *${slotLabel}* par hai.\n🎟️ Token: *${token}*\n📅 Date: ${dateStr}\n\nKripya samay par aayein.`,
   },
 
   en: {
@@ -127,21 +117,16 @@ const TEMPLATES = {
     askSlotButtonLabel: 'Choose time',
     slotsLeftLabel: 'left',
     noSlots: '😔 Sorry, no slots are left for this day. Please choose another day.',
-    paymentCaption: (fee, upiId, clinic, visitType) =>
-      `🧾 *${clinic}*\n${visitType === 'New' ? '🆕 New Patient (new case paper)' : '🔁 Follow-up Patient'}\n\n💳 Appointment Fee: *Rs ${fee}*\nUPI ID: *${upiId}*\n\nScan the QR to pay, and send the payment *screenshot* here.`,
-    freeAppointmentMessage: (visitType) =>
-      `✅ Your appointment is *FREE*${visitType === 'Follow-up' ? ' (Follow-up)' : ''}.\nOur staff is confirming it, please wait a moment.`,
+    paymentCaption: (fee, upiId, clinic) =>
+      `🧾 *${clinic}*\n\n💳 Appointment Fee: *Rs ${fee}*\nUPI ID: *${upiId}*\n\nScan the QR to pay, and send the payment *screenshot* here.`,
+    freeAppointmentMessage: () =>
+      `✅ Your appointment is *FREE*.\nOur staff is confirming it, please wait a moment.`,
     screenshotReceived: '✅ Thank you! We received your payment screenshot.\nOur staff is verifying it, please wait a moment.',
     askForScreenshot: '📸 Please send a screenshot (photo) of your payment.',
     stillWaiting: "⏳ We're still verifying your payment. Please wait a bit, confirmation will arrive soon.",
     bookingConfirmed: (clinic, name, token, dateStr, slotLabel) =>
       `✅ *${clinic}*\n*Booking Confirmed!*\n\n👤 Name: *${name}*\n🎟️ Token Number: *${token}*\n📅 Date: *${dateStr}*\n🕒 Time: *${slotLabel}*\n\nPlease bring your token number with you.`,
     slotNowFull: '😔 Sorry, your chosen time slot just got fully booked. Please contact the doctor.',
-    profileLinkMessage: (link) =>
-      `📝 Please open the secure link below to complete a few additional details (address, allergies, emergency contact):\n${link}`,
-    queueAlert: '🔔 Your turn is coming up soon. Please make your way to the clinic.',
-    appointmentReminder: (name, dateStr, slotLabel, token) =>
-      `⏰ *Appointment Reminder*\n\n👤 ${name}, your appointment today is at *${slotLabel}*.\n🎟️ Token: *${token}*\n📅 Date: ${dateStr}\n\nPlease arrive on time.`,
   },
 };
 
